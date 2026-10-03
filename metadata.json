@@ -1,0 +1,6 @@
+{
+  "name": "CNTEstates",
+  "description": "CNTEstates is an advanced property and rental building management SaaS for private residential, commercial and mixed-use properties.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
