@@ -53,7 +53,8 @@ import {
   UserRole,
   BillingPermission,
 } from '../types';
-import { subscriptionPlans, getSubscriptionPlan } from '../data/mockDatabase';
+import { subscriptionPlans, getSubscriptionPlan, initialOrganizations } from '../data/mockDatabase';
+import { buildBrandedInvoicePdf } from './invoicePdfGenerator';
 import {
   USD_MASTER_PRICING,
   AUTHORITATIVE_MASTER_CURRENCY,
@@ -96,8 +97,11 @@ import {
   checkEventIdempotency,
   authenticateWebhookRequest,
   verifyWebhookPayload,
-  DEFAULT_WEBHOOK_SECRET,
+  createEphemeralWebhookTestSecret,
+  computeWebhookSignatureHeader,
 } from './paymentProviderService';
+
+const RUNTIME_TEST_WEBHOOK_SECRET = createEphemeralWebhookTestSecret();
 import {
   assertTenantAccess,
   TenantIsolationException,
@@ -861,7 +865,8 @@ export const TEST_DEFINITIONS: TestCaseDefinition[] = [
 
       const res = processProviderWebhook({
         rawBody: payload,
-        signatureHeader: DEFAULT_WEBHOOK_SECRET,
+        signatureHeader: computeWebhookSignatureHeader(payload, RUNTIME_TEST_WEBHOOK_SECRET),
+        secret: RUNTIME_TEST_WEBHOOK_SECRET,
       });
 
       const passed =
@@ -902,16 +907,20 @@ export const TEST_DEFINITIONS: TestCaseDefinition[] = [
         },
       };
 
+      const sig = computeWebhookSignatureHeader(payload, RUNTIME_TEST_WEBHOOK_SECRET);
+
       // First run: processes new
       const run1 = processProviderWebhook({
         rawBody: payload,
-        signatureHeader: DEFAULT_WEBHOOK_SECRET,
+        signatureHeader: sig,
+        secret: RUNTIME_TEST_WEBHOOK_SECRET,
       });
 
       // Second run: must detect duplicate
       const run2 = processProviderWebhook({
         rawBody: payload,
-        signatureHeader: DEFAULT_WEBHOOK_SECRET,
+        signatureHeader: sig,
+        secret: RUNTIME_TEST_WEBHOOK_SECRET,
       });
 
       const passed =
@@ -925,6 +934,42 @@ export const TEST_DEFINITIONS: TestCaseDefinition[] = [
         passed,
         actual: `Run 1: ${run1.auditEntry.idempotency_action}, Run 2: ${run2.auditEntry.idempotency_action}`,
         details: { run1, run2 },
+      };
+    },
+  },
+  {
+    id: 'TEST-BILL-08',
+    category: 'billing',
+    name: 'Branded Vector PDF Invoice Generation & Export',
+    requirement: 'Billing: Builds valid vector PDF invoice document matching tenant organization branding, statutory tax rates, and cryptographic audit seal',
+    expected: 'Valid jsPDF instance generated with custom company name, tax ID, and nonzero PDF byte output (> 1000 bytes)',
+    run: () => {
+      const sampleOrg = initialOrganizations[0];
+      const sampleInv = normalizeInvoiceRecord({
+        organization_id: sampleOrg.id,
+        invoice_number: 'CNTE-INV-TEST-PDF',
+        subtotal: 3778,
+        tax: 667,
+        total: 4445,
+        currency: 'ZAR',
+      });
+
+      const pdfDoc = buildBrandedInvoicePdf(sampleInv, sampleOrg, {
+        companyName: 'Centurion Realty Holdings Ltd',
+        taxRegistrationNumber: 'ZA-VAT-4910284901',
+        brandColorHex: '#047857',
+        exportedByRole: 'platform_admin',
+        includeAuditSeal: true,
+        includeTaxBreakdown: true,
+      });
+
+      const blob = pdfDoc.output('blob');
+      const passed = pdfDoc !== null && typeof pdfDoc.output === 'function' && blob.size > 1000;
+
+      return {
+        passed,
+        actual: `Generated vector PDF tax invoice: size=${blob.size} bytes, format=A4 portrait, branding=${sampleOrg.name}`,
+        details: { blobSize: blob.size, invoiceNumber: sampleInv.invoice_number },
       };
     },
   },
@@ -1271,9 +1316,9 @@ export const TEST_DEFINITIONS: TestCaseDefinition[] = [
     expected: 'Invalid signature rejected (401); expired timestamp rejected (400); valid accepted',
     run: () => {
       // 1. Invalid signature
-      const invalidAuth = authenticateWebhookRequest('invalid_signature_secret_xyz');
+      const invalidAuth = authenticateWebhookRequest('invalid_signature_secret_xyz', RUNTIME_TEST_WEBHOOK_SECRET);
       // 2. Valid signature
-      const validAuth = authenticateWebhookRequest(DEFAULT_WEBHOOK_SECRET);
+      const validAuth = authenticateWebhookRequest(RUNTIME_TEST_WEBHOOK_SECRET, RUNTIME_TEST_WEBHOOK_SECRET);
       // 3. Expired timestamp (> 300s old)
       const expiredPayload = {
         id: 'evt_expired_99',

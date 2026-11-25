@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useApp } from '../../context/AppContext';
 import { Currency, Language, OrganizationBranding } from '../../types';
 import {
@@ -34,8 +34,21 @@ import { OperatingCountryConsole } from '../country/OperatingCountryConsole';
 import { ExchangeRateConversionConsole } from '../pricing/ExchangeRateConversionConsole';
 import { ZeroDecimalDisplayConsole } from '../pricing/ZeroDecimalDisplayConsole';
 import { PaymentProviderConsole } from '../pricing/PaymentProviderConsole';
+import { AccountSecurityPanel } from '../security/AccountSecurityPanel';
 
-export const SettingsView: React.FC = () => {
+type SettingsSubTab =
+  | 'account_security'
+  | 'regional_currency'
+  | 'branding_print'
+  | 'exchange_rates'
+  | 'payment_provider'
+  | 'system';
+
+interface SettingsViewProps {
+  initialTab?: SettingsSubTab;
+}
+
+export const SettingsView: React.FC<SettingsViewProps> = ({ initialTab = 'regional_currency' }) => {
   const {
     organization,
     setOrganization,
@@ -53,11 +66,15 @@ export const SettingsView: React.FC = () => {
     openPrint,
   } = useApp();
 
-  const [activeSubTab, setActiveSubTab] = useState<'regional_currency' | 'branding_print' | 'exchange_rates' | 'payment_provider' | 'system'>('regional_currency');
+  const [activeSubTab, setActiveSubTab] = useState<SettingsSubTab>(initialTab);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [saveMessage, setSaveMessage] = useState('');
   const [resetConfirm, setResetConfirm] = useState(false);
   const [showBaseCurrencyModal, setShowBaseCurrencyModal] = useState(false);
+
+  useEffect(() => {
+    setActiveSubTab(initialTab);
+  }, [initialTab]);
 
   // Form states
   const [orgName, setOrgName] = useState(organization.name);
@@ -198,17 +215,18 @@ export const SettingsView: React.FC = () => {
       {/* Settings Navigation Tabs */}
       <div className="flex items-center gap-1 overflow-x-auto p-1 bg-slate-900 border border-slate-800 rounded-xl text-xs">
         {[
-          { id: 'regional_currency', label: '1. Country & Multi-Currency', icon: Globe },
-          { id: 'exchange_rates', label: '2. Exchange Rate Architecture', icon: ArrowRightLeft },
-          { id: 'payment_provider', label: '3. Payment Provider & Webhooks', icon: CreditCard },
-          { id: 'branding_print', label: '4. Corporate Branding & Print Engine', icon: Printer },
-          { id: 'system', label: '5. System & Demo Reset', icon: Sliders },
+          { id: 'account_security', label: 'Account Security & Providers', icon: Shield },
+          { id: 'regional_currency', label: 'Country & Multi-Currency', icon: Globe },
+          { id: 'exchange_rates', label: 'Exchange Rate Architecture', icon: ArrowRightLeft },
+          { id: 'payment_provider', label: 'Payment Provider & Webhooks', icon: CreditCard },
+          { id: 'branding_print', label: 'Corporate Branding & Print', icon: Printer },
+          { id: 'system', label: 'System & Reset', icon: Sliders },
         ].map((tab) => {
           const Icon = tab.icon;
           return (
             <button
               key={tab.id}
-              onClick={() => setActiveSubTab(tab.id as any)}
+              onClick={() => setActiveSubTab(tab.id as SettingsSubTab)}
               className={`flex items-center gap-2 px-3.5 py-2 rounded-lg font-semibold transition-all shrink-0 cursor-pointer ${
                 activeSubTab === tab.id
                   ? 'bg-emerald-600 text-white shadow-sm'
@@ -221,6 +239,9 @@ export const SettingsView: React.FC = () => {
           );
         })}
       </div>
+
+      {/* ACCOUNT SECURITY & MULTI-PROVIDER LINKING */}
+      {activeSubTab === 'account_security' && <AccountSecurityPanel />}
 
       {/* TAB 1: OPERATING COUNTRY & MULTI-CURRENCY */}
       {activeSubTab === 'regional_currency' && (

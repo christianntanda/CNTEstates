@@ -21,20 +21,11 @@ import {
   XCircle,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { authenticatedFetch } from '../../utils/authFetch';
 import {
   PAYMENT_PROVIDER_NAME,
-  DEFAULT_WEBHOOK_SECRET,
-  processProviderWebhook,
   getWebhookAuditLogs,
-  getOrCreateProviderCustomer,
-  createProviderSubscription,
-  changeProviderSubscription,
-  executeProviderRenewal,
-  executeProviderCancellation,
-  handleProviderPaymentFailure,
-  syncProviderInvoice,
   WebhookAuditEntry,
-  WebhookEventPayload,
 } from '../../services/paymentProviderService';
 import { subscriptionPlans } from '../../data/mockDatabase';
 
@@ -54,7 +45,6 @@ export const PaymentProviderConsole: React.FC = () => {
   const [selectedEventType, setSelectedEventType] = useState<
     'invoice.paid' | 'invoice.payment_failed' | 'customer.subscription.updated' | 'customer.subscription.deleted'
   >('invoice.paid');
-  const [webhookSecretInput, setWebhookSecretInput] = useState<string>(DEFAULT_WEBHOOK_SECRET);
   const [simulateTimestampAgeSeconds, setSimulateTimestampAgeSeconds] = useState<number>(0);
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
   const [lastSimulationResult, setLastSimulationResult] = useState<any>(null);
@@ -74,7 +64,7 @@ export const PaymentProviderConsole: React.FC = () => {
 
   useEffect(() => {
     // Initial fetch from server or service
-    fetch('/api/payment-provider/webhooks/audit')
+    authenticatedFetch('/api/payment-provider/webhooks/audit')
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data?.audits) {
@@ -98,7 +88,7 @@ export const PaymentProviderConsole: React.FC = () => {
       ? subscriptionInvoices[0].external_invoice_id || `in_stripe_${organization.id}_latest`
       : `in_stripe_${organization.id}_001`;
 
-  // 1. Simulate Webhook Execution
+  // 1. Simulate Webhook Execution (signing stays strictly server-side; no secret ever enters the browser)
   const handleSimulateWebhook = async (params?: {
     forceInvalidSecret?: boolean;
     forceExpiredTimestamp?: boolean;
@@ -107,64 +97,39 @@ export const PaymentProviderConsole: React.FC = () => {
     setIsSimulating(true);
     setActionFeedback(null);
 
-    const nowUnix = Math.floor(Date.now() / 1000);
-    const createdTimestamp = params?.forceExpiredTimestamp
-      ? nowUnix - 600 // 10 minutes ago (> 300s tolerance)
-      : nowUnix - (simulateTimestampAgeSeconds || 0);
-
     const eventId = params?.reuseEventId
       ? lastUsedEventId
       : `evt_stripe_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
     setLastUsedEventId(eventId);
 
-    const signature = params?.forceInvalidSecret
-      ? 'bad_secret_invalid_signature_tampered_payload'
-      : webhookSecretInput;
-
-    const mockPayload: WebhookEventPayload = {
-      id: eventId,
-      object: 'event',
-      api_version: '2026-09-01',
-      created: createdTimestamp,
-      type: selectedEventType,
-      data: {
-        object: {
-          id: selectedEventType.startsWith('invoice') ? `in_stripe_${Date.now()}` : providerSubscriptionId,
-          customer: providerCustomerId,
-          subscription: providerSubscriptionId,
-          organization_id: organization.id,
-          amount_paid: activeSubscription.current_price,
-          total: activeSubscription.current_price,
-          currency: activeSubscription.billing_currency || 'ZAR',
-          status: selectedEventType === 'invoice.payment_failed' ? 'past_due' : 'paid',
-          last_payment_error:
-            selectedEventType === 'invoice.payment_failed'
-              ? { code: 'card_declined', message: 'Insufficient funds on credit card' }
-              : null,
-        },
-      },
-    };
-
     try {
-      // Send to server webhook endpoint for full full-stack verification
-      const res = await fetch('/api/payment-provider/webhook', {
+      const res = await authenticatedFetch('/api/payment-provider/simulate-event', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'stripe-signature': signature,
+          'x-organization-id': organization.id,
         },
-        body: JSON.stringify(mockPayload),
+        body: JSON.stringify({
+          event_type: selectedEventType,
+          event_id: eventId,
+          organization_id: organization.id,
+          customer_id: providerCustomerId,
+          subscription_id: providerSubscriptionId,
+          force_invalid_signature: Boolean(params?.forceInvalidSecret),
+          timestamp_age_seconds: params?.forceExpiredTimestamp ? 600 : (simulateTimestampAgeSeconds || 0),
+        }),
       });
 
       const data = await res.json();
+      const effectiveStatus = data.http_status || res.status;
       setLastSimulationResult({
-        http_status: res.status,
+        http_status: effectiveStatus,
         ...data,
       });
 
-      if (res.ok) {
-        if (data.idempotent_replay) {
+      if (res.ok && data.success) {
+        if (data.result?.idempotent_replay) {
           setActionFeedback({
             type: 'info',
             text: `[IDEMPOTENT REPLAY]: Duplicate event '${eventId}' recognized. Returned cached execution without duplicate billing.`,
@@ -172,9 +137,8 @@ export const PaymentProviderConsole: React.FC = () => {
         } else {
           setActionFeedback({
             type: 'success',
-            text: `[WEBHOOK PROCESSED]: Event '${selectedEventType}' authenticated, verified, and audited.`,
+            text: `[WEBHOOK PROCESSED]: Event '${selectedEventType}' authenticated server-side, verified, and audited.`,
           });
-          // Also sync in UI if renewal or change
           if (selectedEventType === 'invoice.paid') {
             await executeSubscriptionLifecycle('renewal', {
               reason: `Stripe webhook invoice.paid for ${providerSubscriptionId}`,
@@ -184,35 +148,21 @@ export const PaymentProviderConsole: React.FC = () => {
       } else {
         setActionFeedback({
           type: 'error',
-          text: `[WEBHOOK REJECTED HTTP ${res.status}]: ${data.error || 'Authentication/Verification failed'}`,
+          text: `[WEBHOOK REJECTED HTTP ${effectiveStatus}]: ${data.result?.error || data.error || 'Authentication/Verification failed'}`,
         });
       }
 
-      // Re-fetch audit logs
-      const auditRes = await fetch('/api/payment-provider/webhooks/audit');
+      const auditRes = await authenticatedFetch('/api/payment-provider/webhooks/audit');
       if (auditRes.ok) {
         const auditData = await auditRes.json();
         setAuditLogs(auditData.audits || []);
       } else {
         refreshAuditLogs();
       }
-    } catch {
-      // Client-side fallback if server offline
-      const localResult = processProviderWebhook({
-        rawBody: mockPayload,
-        signatureHeader: signature,
-        secret: DEFAULT_WEBHOOK_SECRET,
-      });
-
-      setLastSimulationResult({
-        http_status: localResult.status,
-        ...localResult,
-      });
-      refreshAuditLogs();
-
+    } catch (err: any) {
       setActionFeedback({
-        type: localResult.success ? 'success' : 'error',
-        text: localResult.auditEntry.summary,
+        type: 'error',
+        text: err?.message || 'Unable to reach server webhook verifier.',
       });
     } finally {
       setIsSimulating(false);
@@ -223,7 +173,7 @@ export const PaymentProviderConsole: React.FC = () => {
   const handleExecuteSubscriptionChange = async () => {
     setActionFeedback(null);
     try {
-      const res = await fetch(`/api/payment-provider/subscriptions/${providerSubscriptionId}/change`, {
+      const res = await authenticatedFetch(`/api/payment-provider/subscriptions/${providerSubscriptionId}/change`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -262,7 +212,7 @@ export const PaymentProviderConsole: React.FC = () => {
   const handleSyncInvoices = async () => {
     setActionFeedback(null);
     try {
-      const res = await fetch('/api/payment-provider/invoices/sync', {
+      const res = await authenticatedFetch('/api/payment-provider/invoices/sync', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -307,7 +257,7 @@ export const PaymentProviderConsole: React.FC = () => {
   const handleSimulatePaymentFailure = async () => {
     setActionFeedback(null);
     try {
-      const res = await fetch('/api/payment-provider/simulate-event', {
+      const res = await authenticatedFetch('/api/payment-provider/simulate-event', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -719,13 +669,11 @@ export const PaymentProviderConsole: React.FC = () => {
               </div>
 
               <div>
-                <label className="text-[10px] text-slate-400 block mb-1">Webhook Secret (Header Auth)</label>
-                <input
-                  type="text"
-                  value={webhookSecretInput}
-                  onChange={(e) => setWebhookSecretInput(e.target.value)}
-                  className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-200"
-                />
+                <label className="text-[10px] text-slate-400 block mb-1">Webhook Signing Secret</label>
+                <div className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-emerald-300 flex items-center gap-1.5">
+                  <Lock className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                  <span className="truncate">Server-managed (PAYMENT_WEBHOOK_SECRET)</span>
+                </div>
               </div>
 
               <div>

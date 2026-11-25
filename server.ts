@@ -2,8 +2,15 @@ import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import {
+  initializeApp as initializeAdminApp,
+  getApps as getAdminApps,
+  getApp as getAdminApp,
+} from 'firebase-admin/app';
+import { getAuth as getAdminAuth } from 'firebase-admin/auth';
 import {
   subscriptionPlans,
   initialOrganizations,
@@ -90,7 +97,8 @@ import {
 import {
   PAYMENT_PROVIDER_NAME,
   PAYMENT_PROVIDER_CODE,
-  DEFAULT_WEBHOOK_SECRET,
+  createEphemeralWebhookTestSecret,
+  computeWebhookSignatureHeader,
   initializeProviderRegistry,
   getOrCreateProviderCustomer,
   createProviderSubscription,
@@ -106,6 +114,12 @@ import {
   getProviderSubscription,
   type WebhookEventPayload,
 } from './src/services/paymentProviderService';
+
+// Server-only webhook signing secret: loaded strictly from environment, never hardcoded or exposed to clients.
+const SERVER_PAYMENT_WEBHOOK_SECRET =
+  process.env.PAYMENT_WEBHOOK_SECRET && process.env.PAYMENT_WEBHOOK_SECRET !== 'MY_PAYMENT_WEBHOOK_SECRET'
+    ? process.env.PAYMENT_WEBHOOK_SECRET
+    : createEphemeralWebhookTestSecret();
 import {
   normalizeSubscriptionRecord,
   validateSubscriptionConstraints,
@@ -256,18 +270,405 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ========================================================
+// FIREBASE ID TOKEN VERIFICATION (Zero-IAM verifyIdToken)
+// ========================================================
+const BOOTSTRAPPED_ADMIN_EMAIL = 'christian.ntanda@gmail.com';
+const ALLOWED_REGISTRATION_ROLES = new Set([
+  'org_owner',
+  'portfolio_manager',
+  'property_manager',
+  'building_manager',
+  'finance_manager',
+  'maintenance_manager',
+  'technician',
+  'contractor',
+  'security_officer',
+  'facility_manager',
+  'tenant',
+  'auditor',
+]);
+
+let firebaseProjectId = process.env.FIREBASE_PROJECT_ID || '';
+try {
+  const cfgPath = path.resolve(__dirname, 'firebase-applet-config.json');
+  if (fs.existsSync(cfgPath)) {
+    const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+    if (parsed?.projectId && parsed.projectId !== 'remixed-project-id') {
+      firebaseProjectId = parsed.projectId;
+    }
+  }
+} catch {
+  // Ignore missing config in isolated test runs
+}
+
+const firebaseAdminApp =
+  firebaseProjectId
+    ? getAdminApps().length > 0
+      ? getAdminApp()
+      : initializeAdminApp({ projectId: firebaseProjectId })
+    : null;
+
+interface VerifiedAuthContext {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  signInProvider: string;
+  authorizedOrgId: string;
+  role: string;
+  isPlatformAdmin: boolean;
+}
+
+interface VerifiedTenantRecord {
+  uid: string;
+  email: string;
+  fullName: string;
+  organizationId: string;
+  organizationName: string;
+  role: string;
+  operatingCountry: string;
+  preferredLanguage: string;
+  baseCurrency: string;
+  termsAcceptedAt?: string;
+  privacyAcceptedAt?: string;
+  createdAt: string;
+}
+
+const verifiedTenantRegistry = new Map<string, VerifiedTenantRecord>();
+
+function deriveAuthoritativeOrgId(uid: string): string {
+  const cleaned = String(uid || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_\-]/g, '_')
+    .slice(0, 40);
+  return `org_${cleaned || 'tenant'}`;
+}
+
+function ensureIsolatedBackendOrganization(params: {
+  orgId: string;
+  name: string;
+  planId?: string;
+  operatingCountry?: string;
+  baseCurrency?: string;
+}): Organization {
+  const existing = initialOrganizations.find((o) => o.id === params.orgId);
+  if (existing) return existing;
+
+  const countryCfg = getCountryConfiguration(params.operatingCountry || 'South Africa');
+  const currency = params.baseCurrency || countryCfg?.default_currency || 'ZAR';
+  const planId = (params.planId || 'free') as SubscriptionPlanId;
+  const planUsdPrice = getMasterPriceUsd(planId) ?? 0;
+  const newOrg: Organization = {
+    id: params.orgId,
+    name: params.name || 'CNTEstates Organization',
+    country: params.operatingCountry || 'South Africa',
+    operatingCountry: params.operatingCountry || 'South Africa',
+    currency,
+    baseCurrency: currency,
+    billingCurrency: currency,
+    timezone: 'Africa/Johannesburg',
+    planId,
+    subscriptionStatus: planId === 'free' ? 'free' : 'active',
+    monthlySpend: planUsdPrice,
+    renewalDate: planId === 'free' ? '2099-12-31' : '2027-01-01',
+    createdAt: new Date().toISOString(),
+  };
+  initialOrganizations.push(newOrg);
+  initializeSubscriptionDatabase([newOrg]);
+  initializeProviderRegistry([newOrg]);
+  return newOrg;
+}
+
+declare global {
+  namespace Express {
+    interface Request {
+      verifiedAuth?: VerifiedAuthContext;
+    }
+  }
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
 
   app.use(express.json({ limit: '10mb' }));
 
-  // AI Operations Route with Gemini API
+  // ========================================================
+  // GLOBAL API IDENTITY VERIFICATION & TENANT ISOLATION GATE
+  // ========================================================
+  app.use('/api', async (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const rawRoleHeader = (req.headers['x-user-role'] as string) || '';
+
+    // 1. Cryptographically verify Firebase ID JWT when supplied
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.substring(7).trim();
+      const isJwtFormat = token.split('.').length === 3;
+      if (isJwtFormat && firebaseAdminApp) {
+        try {
+          const decoded = await getAdminAuth(firebaseAdminApp).verifyIdToken(token);
+          if (!decoded.email_verified) {
+            return res.status(403).json({
+              success: false,
+              error: 'EMAIL_NOT_VERIFIED',
+              message: 'Verify your email address before accessing protected CNTEstates APIs.',
+            });
+          }
+
+          const uid = decoded.uid;
+          const email = decoded.email || '';
+          const isPlatformAdmin =
+            email.toLowerCase() === BOOTSTRAPPED_ADMIN_EMAIL.toLowerCase();
+          const existingProfile = verifiedTenantRegistry.get(uid);
+          const authorizedOrgId =
+            existingProfile?.organizationId || deriveAuthoritativeOrgId(uid);
+
+          // Ensure isolated tenant org exists on the server (never falls back to org-1)
+          ensureIsolatedBackendOrganization({
+            orgId: authorizedOrgId,
+            name:
+              existingProfile?.organizationName ||
+              `${decoded.name || email.split('@')[0] || 'My'} Estates Portfolio`,
+            operatingCountry: existingProfile?.operatingCountry || 'South Africa',
+            baseCurrency: existingProfile?.baseCurrency,
+          });
+
+          const resolvedRole = isPlatformAdmin
+            ? 'platform_admin'
+            : existingProfile?.role || 'org_owner';
+
+          req.verifiedAuth = {
+            uid,
+            email,
+            emailVerified: true,
+            signInProvider: decoded.firebase?.sign_in_provider || 'firebase',
+            authorizedOrgId,
+            role: resolvedRole,
+            isPlatformAdmin,
+          };
+
+          // Enforce strict tenant isolation: block cross-tenant org ID tampering immediately
+          if (!isPlatformAdmin) {
+            const suppliedOrgIds = [
+              req.headers['x-organization-id'] as string | undefined,
+              req.query.organizationId as string | undefined,
+              typeof req.body === 'object' && req.body ? req.body.organizationId : undefined,
+              typeof req.body === 'object' && req.body ? req.body.organization_id : undefined,
+            ].filter((v): v is string => typeof v === 'string' && v.trim().length > 0);
+
+            const crossTenantAttempt = suppliedOrgIds.find(
+              (candidate) => candidate.trim() !== authorizedOrgId
+            );
+            if (crossTenantAttempt) {
+              validateTenantAccess(
+                {
+                  requestingOrgId: authorizedOrgId,
+                  userRole: resolvedRole,
+                  userId: uid,
+                },
+                crossTenantAttempt,
+                'subscription',
+                `${req.method} ${req.path}`,
+                'api'
+              );
+              return res.status(403).json({
+                success: false,
+                error: 'TENANT_ISOLATION_VIOLATION',
+                requesting_organization_id: authorizedOrgId,
+                target_organization_id: crossTenantAttempt,
+                message: `Strict Account Isolation Violation: Account '${authorizedOrgId}' is prohibited from accessing organization '${crossTenantAttempt}'.`,
+              });
+            }
+
+            if (rawRoleHeader === 'platform_admin') {
+              return res.status(403).json({
+                success: false,
+                error: 'RBAC_PRIVILEGE_ESCALATION_BLOCKED',
+                message:
+                  'Unauthorized privilege escalation blocked. Platform Administrator role cannot be asserted via client headers.',
+              });
+            }
+          }
+        } catch {
+          return res.status(401).json({
+            success: false,
+            error: 'INVALID_FIREBASE_TOKEN',
+            message: 'Your authentication session is invalid or expired. Please sign in again.',
+          });
+        }
+      }
+    }
+
+    // 2. Strictly guard all /api/admin/* routes with verified platform admin identity
+    if (req.path.startsWith('/admin/')) {
+      if (!req.verifiedAuth || !req.verifiedAuth.isPlatformAdmin) {
+        return res.status(403).json({
+          success: false,
+          error: 'PLATFORM_ADMIN_REQUIRED',
+          message:
+            'SaaS Platform Administrator privileges verified by Firebase Authentication are required for this endpoint.',
+        });
+      }
+    }
+
+    return next();
+  });
+
+  // ========================================================
+  // AUTHENTICATED SESSION & TENANT REGISTRATION ENDPOINTS
+  // ========================================================
+  app.get('/api/auth/session', (req, res) => {
+    if (!req.verifiedAuth) {
+      return res.status(401).json({
+        success: false,
+        error: 'AUTHENTICATION_REQUIRED',
+        message: 'A verified Firebase ID token is required to retrieve session details.',
+      });
+    }
+
+    const { uid, email, emailVerified, signInProvider, authorizedOrgId, role, isPlatformAdmin } =
+      req.verifiedAuth;
+    const org = initialOrganizations.find((o) => o.id === authorizedOrgId);
+    const profile = verifiedTenantRegistry.get(uid);
+
+    return res.json({
+      success: true,
+      session: {
+        uid,
+        email,
+        emailVerified,
+        signInProvider,
+        authorizedOrganizationId: authorizedOrgId,
+        role,
+        isPlatformAdmin,
+        preferredLanguage: profile?.preferredLanguage || 'en',
+        organization: org || null,
+      },
+    });
+  });
+
+  app.post('/api/auth/register-tenant', (req, res) => {
+    if (!req.verifiedAuth) {
+      return res.status(401).json({
+        success: false,
+        error: 'AUTHENTICATION_REQUIRED',
+        message: 'A verified Firebase ID token is required to register a CNTEstates tenant.',
+      });
+    }
+
+    const { uid, email, isPlatformAdmin, authorizedOrgId } = req.verifiedAuth;
+    const {
+      fullName,
+      organizationName,
+      accountCategory,
+      operatingCountry = 'South Africa',
+      preferredLanguage = 'en',
+      selectedPlanId = 'free',
+      termsAccepted,
+      privacyAccepted,
+      termsAcceptedAt,
+      privacyAcceptedAt,
+    } = req.body || {};
+
+    // Prevent duplicate tenant profiles for the same Firebase UID
+    const existingProfile = verifiedTenantRegistry.get(uid);
+    if (existingProfile) {
+      const existingOrg = initialOrganizations.find((o) => o.id === existingProfile.organizationId);
+      return res.json({
+        success: true,
+        alreadyRegistered: true,
+        profile: existingProfile,
+        organization: existingOrg || null,
+      });
+    }
+
+    if (termsAccepted === false || privacyAccepted === false) {
+      return res.status(400).json({
+        success: false,
+        error: 'LEGAL_CONSENT_REQUIRED',
+        message: 'You must accept both the Terms and Conditions and Privacy Policy to register.',
+      });
+    }
+
+    // Never grant platform_admin during registration
+    const safeRole = isPlatformAdmin
+      ? 'platform_admin'
+      : ALLOWED_REGISTRATION_ROLES.has(accountCategory)
+      ? accountCategory
+      : 'org_owner';
+
+    const countryCfg = getCountryConfiguration(operatingCountry);
+    const baseCurrency = countryCfg?.default_currency || 'ZAR';
+    const safePlanId = ['free', 'starter', 'basic', 'professional', 'business', 'enterprise'].includes(
+      selectedPlanId
+    )
+      ? selectedPlanId
+      : 'free';
+
+    const orgDisplayName =
+      typeof organizationName === 'string' && organizationName.trim().length > 0
+        ? organizationName.trim().slice(0, 160)
+        : `${String(fullName || email.split('@')[0] || 'My').trim()} Estates Portfolio`;
+
+    const existingOrg = initialOrganizations.find((o) => o.id === authorizedOrgId);
+    const org = existingOrg
+      ? Object.assign(existingOrg, {
+          name: orgDisplayName,
+          operatingCountry,
+          country: operatingCountry,
+          baseCurrency,
+          billingCurrency: baseCurrency,
+          currency: baseCurrency,
+          planId: safePlanId as SubscriptionPlanId,
+          subscriptionStatus: safePlanId === 'free' ? 'free' : 'active',
+        })
+      : ensureIsolatedBackendOrganization({
+          orgId: authorizedOrgId,
+          name: orgDisplayName,
+          planId: safePlanId,
+          operatingCountry,
+          baseCurrency,
+        });
+
+    const record: VerifiedTenantRecord = {
+      uid,
+      email,
+      fullName: String(fullName || email.split('@')[0] || 'User').trim().slice(0, 120),
+      organizationId: authorizedOrgId,
+      organizationName: org.name,
+      role: safeRole,
+      operatingCountry,
+      preferredLanguage: ['en', 'fr', 'es', 'pt'].includes(preferredLanguage)
+        ? preferredLanguage
+        : 'en',
+      baseCurrency,
+      termsAcceptedAt: typeof termsAcceptedAt === 'string' ? termsAcceptedAt.slice(0, 40) : new Date().toISOString(),
+      privacyAcceptedAt: typeof privacyAcceptedAt === 'string' ? privacyAcceptedAt.slice(0, 40) : new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+    };
+    verifiedTenantRegistry.set(uid, record);
+
+    return res.status(201).json({
+      success: true,
+      alreadyRegistered: false,
+      profile: record,
+      organization: org,
+    });
+  });
+
+  // AI Operations Route with Gemini API (strictly scoped to verified tenant)
   app.post('/api/ai/query', async (req, res) => {
     try {
+      if (!req.verifiedAuth) {
+        return res.status(401).json({
+          success: false,
+          error: 'AUTHENTICATION_REQUIRED',
+          message: 'Verified authentication is required to query the CNTEstates AI Assistant.',
+        });
+      }
       const { prompt, context, language = 'en', actionPayload } = req.body;
-      const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-      const userRole = (req.headers['x-user-role'] as string) || req.body.userRole || 'property_manager';
+      const orgId = req.verifiedAuth.authorizedOrgId;
+      const userRole = req.verifiedAuth.role;
 
       // SEQUENCE 32: Intercept billing-related queries and enforce AI Billing Safety invariants
       const billingCheck = classifyAiBillingIntent(prompt || '');
@@ -362,12 +763,24 @@ Include actionable next steps or recommendations for the property manager.`;
     resourceType: ProtectedResourceType,
     action: string = 'access'
   ): boolean {
-    const requestingOrgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const userRole = (req.headers['x-user-role'] as string) || 'property_manager';
-    const userId = (req.headers['x-user-id'] as string) || 'usr-1';
+    const requestingOrgId = req.verifiedAuth
+      ? req.verifiedAuth.authorizedOrgId
+      : (req.headers['x-organization-id'] as string) || '';
+    const userRole = req.verifiedAuth
+      ? req.verifiedAuth.role
+      : (req.headers['x-user-role'] as string) || 'tenant';
+    const userId = req.verifiedAuth
+      ? req.verifiedAuth.uid
+      : (req.headers['x-user-id'] as string) || 'anonymous';
+
+    // Never allow unverified callers to claim platform_admin bypass
+    const effectiveRole =
+      userRole === 'platform_admin' && !req.verifiedAuth?.isPlatformAdmin
+        ? 'unauthorized'
+        : userRole;
 
     const check = validateTenantAccess(
-      { requestingOrgId, userRole, userId },
+      { requestingOrgId, userRole: effectiveRole, userId },
       targetOrgId,
       resourceType,
       action,
@@ -379,7 +792,7 @@ Include actionable next steps or recommendations for the property manager.`;
         success: false,
         error: 'TENANT_ISOLATION_VIOLATION',
         resource: resourceType,
-        requesting_organization_id: requestingOrgId,
+        requesting_organization_id: requestingOrgId || 'unauthenticated',
         target_organization_id: targetOrgId,
         message: check.error || `Security Tenant Isolation Violation: Access to ${resourceType} of organization '${targetOrgId}' denied for requesting context '${requestingOrgId}'.`,
       });
@@ -397,12 +810,13 @@ Include actionable next steps or recommendations for the property manager.`;
     permission: BillingPermission,
     actionName?: string
   ): boolean {
+    const rawRole = req.verifiedAuth
+      ? req.verifiedAuth.role
+      : (req.headers['x-user-role'] as string) || 'tenant';
     const userRole =
-      (req.headers['x-user-role'] as string) ||
-      (req.headers['x-user-id'] as string) ||
-      (req.query.role as string) ||
-      (req.body && req.body.userRole) ||
-      'property_manager';
+      rawRole === 'platform_admin' && !req.verifiedAuth?.isPlatformAdmin
+        ? 'tenant'
+        : rawRole;
 
     if (!hasBillingPermission(userRole, permission)) {
       const explanation = getPermissionDenialExplanation(userRole, permission);
@@ -424,7 +838,7 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // ========================================================
   // SEQUENCE 31 — AUTHORITATIVE BILLING API CONTEXT GUARD
-  // Enforces Authentication, Authorization (RBAC), and Tenant Isolation
+  // Enforces Cryptographic Firebase Auth, RBAC, and Tenant Isolation
   // ========================================================
   function authenticateBillingContext(
     req: express.Request,
@@ -439,48 +853,30 @@ Include actionable next steps or recommendations for the property manager.`;
     userId: string;
     org: Organization;
   } | null {
-    const authHeader = req.headers['authorization'];
-    const orgHeader = req.headers['x-organization-id'] as string;
-    const roleHeader = req.headers['x-user-role'] as string;
-    const userHeader = req.headers['x-user-id'] as string;
-
-    let requestingOrgId = orgHeader;
-    if (!requestingOrgId && authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.substring(7).trim();
-      const match = token.match(/(?:bearer_|token_)?(org-\d+|org-[a-zA-Z0-9_-]+)/);
-      if (match) {
-        requestingOrgId = match[1];
-      }
-    }
-
-    if (!requestingOrgId) {
-      if (roleHeader === 'platform_admin') {
-        requestingOrgId = (req.query.organizationId as string) || 'org-1';
-      } else if (!orgHeader && !authHeader && !roleHeader && !userHeader) {
-        res.status(401).json({
-          success: false,
-          error: 'AUTHENTICATION_REQUIRED',
-          message: 'Authentication required. Please provide a valid x-organization-id header, x-user-role header, or Authorization Bearer token.',
-        });
-        return null;
-      } else {
-        requestingOrgId = 'org-1';
-      }
-    }
-
-    const org = initialOrganizations.find((o) => o.id === requestingOrgId);
-    if (!org) {
+    // Cryptographically verified Firebase identity is authoritative
+    if (!req.verifiedAuth) {
       res.status(401).json({
         success: false,
-        error: 'INVALID_CREDENTIALS',
-        message: `Authentication failed: Organization '${requestingOrgId}' is not registered or authenticated in CNTEstates.`,
+        error: 'AUTHENTICATION_REQUIRED',
+        message: 'Verified Firebase Authentication (Authorization: Bearer <ID_TOKEN>) is required.',
       });
       return null;
     }
 
-    const userRole = roleHeader || 'property_manager';
-    const userId = userHeader || (userRole === 'platform_admin' ? 'usr-platform-admin' : 'usr-1');
-    const targetOrgId = targetOrgIdOverride || (req.query.organizationId as string) || requestingOrgId;
+    const requestingOrgId = req.verifiedAuth.authorizedOrgId;
+    const userRole = req.verifiedAuth.role;
+    const userId = req.verifiedAuth.uid;
+    const targetOrgId =
+      targetOrgIdOverride ||
+      (req.verifiedAuth.isPlatformAdmin && (req.query.organizationId as string)) ||
+      requestingOrgId;
+
+    const org =
+      initialOrganizations.find((o) => o.id === requestingOrgId) ||
+      ensureIsolatedBackendOrganization({
+        orgId: requestingOrgId,
+        name: `${req.verifiedAuth.email.split('@')[0] || 'Tenant'} Portfolio`,
+      });
 
     if (permission) {
       if (!checkBillingRbac(req, res, permission, permission)) {
@@ -1218,8 +1614,11 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 7b. POST /api/subscription/upgrade/preview — Previews authoritative adjustment & steps without committing
   app.post('/api/subscription/upgrade/preview', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const requestedOrgId = (req.headers['x-organization-id'] as string) || req.body?.organizationId;
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', requestedOrgId, 'subscription');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const { targetPlanId, billingPeriod = 'monthly', customSchedule } = req.body;
 
     const currentPlan = getSubscriptionPlan(org.planId) || subscriptionPlans[0];
@@ -1254,16 +1653,24 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 7c. POST /api/subscription/upgrade — Executes authoritative 11-step upgrade pipeline
   app.post('/api/subscription/upgrade', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const requestedOrgId = (req.headers['x-organization-id'] as string) || req.body?.organizationId;
+    const authCtx = authenticateBillingContext(req, res, 'upgrade', requestedOrgId, 'subscription');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const payload = { ...req.body };
 
-    // MANDATE: "Backend pricing must be authoritative. Do not trust frontend-submitted prices."
+    // MANDATE: "Backend pricing & payment status must be authoritative. Never trust frontend-submitted prices or payment status."
     delete (payload as any).price;
     delete (payload as any).masterPrice;
     delete (payload as any).amount;
     delete (payload as any).rate;
     delete (payload as any).discount;
+    delete (payload as any).payment_status;
+    delete (payload as any).invoice_status;
+    delete (payload as any).subscription_status;
+    delete (payload as any).organizationId;
+    delete (payload as any).organization_id;
 
     const result = executeSecureUpgrade({
       organization: org,
@@ -1363,12 +1770,12 @@ Include actionable next steps or recommendations for the property manager.`;
     const { invoiceId } = req.params;
     const invoice = getInvoiceById(invoiceId);
 
+    const authCtx = authenticateBillingContext(req, res, 'view_invoices', invoice?.organization_id, 'invoice');
+    if (!authCtx) return;
+
     if (!invoice) {
       return res.status(404).json({ success: false, error: `Invoice '${invoiceId}' was not found.` });
     }
-
-    const authCtx = authenticateBillingContext(req, res, 'view_invoices', invoice.organization_id, 'invoice');
-    if (!authCtx) return;
 
     return res.json({
       success: true,
@@ -1421,15 +1828,29 @@ Include actionable next steps or recommendations for the property manager.`;
     const { invoiceId } = req.params;
     const invoice = getInvoiceById(invoiceId);
 
+    // Require verified authentication BEFORE leaking whether an arbitrary invoice ID exists
+    const authCtx = authenticateBillingContext(
+      req,
+      res,
+      'change_billing_info',
+      invoice?.organization_id,
+      'payment'
+    );
+    if (!authCtx) return;
+
     if (!invoice) {
       return res.status(404).json({ success: false, error: `Invoice '${invoiceId}' was not found.` });
     }
 
-    const authCtx = authenticateBillingContext(req, res, 'view_invoices', invoice.organization_id, 'payment');
-    if (!authCtx) return;
-
-    const { paymentMethod, transactionReference } = req.body;
-    const rawAmount = req.body.paymentAmount !== undefined ? req.body.paymentAmount : req.body.amount;
+    // Never trust frontend-supplied payment_status or invoice_status overrides
+    const paymentMethod = typeof req.body?.paymentMethod === 'string' ? req.body.paymentMethod : undefined;
+    const transactionReference =
+      typeof req.body?.transactionReference === 'string'
+        ? req.body.transactionReference
+        : typeof req.body?.idempotency_key === 'string'
+        ? req.body.idempotency_key
+        : undefined;
+    const rawAmount = req.body?.paymentAmount !== undefined ? req.body.paymentAmount : req.body?.amount;
 
     if (rawAmount === undefined || isNaN(Number(rawAmount)) || Number(rawAmount) <= 0) {
       return res.status(400).json({ success: false, error: 'A valid positive payment amount is required.' });
@@ -1443,6 +1864,13 @@ Include actionable next steps or recommendations for the property manager.`;
     });
 
     if (!result.success) {
+      if (result.duplicate) {
+        return res.status(409).json({
+          success: false,
+          code: 'DUPLICATE_PAYMENT_PREVENTED',
+          error: result.error,
+        });
+      }
       return res.status(422).json({ success: false, error: result.error });
     }
 
@@ -1461,18 +1889,17 @@ Include actionable next steps or recommendations for the property manager.`;
     const { invoiceId } = req.params;
     const invoice = getInvoiceById(invoiceId);
 
+    const authCtx = authenticateBillingContext(
+      req,
+      res,
+      'change_billing_info',
+      invoice?.organization_id,
+      'invoice'
+    );
+    if (!authCtx) return;
+
     if (!invoice) {
       return res.status(404).json({ success: false, error: `Invoice '${invoiceId}' was not found.` });
-    }
-
-    // SEQUENCE 28: RBAC check
-    if (!checkBillingRbac(req, res, 'change_billing_info', 'update_invoice_status')) {
-      return;
-    }
-
-    // SEQUENCE 27: Enforce strict multi-tenant boundary on invoice status transition
-    if (!checkTenantBoundary(req, res, invoice.organization_id, 'invoice', 'update_invoice_status')) {
-      return;
     }
 
     const { targetStatus, reason } = req.body;
@@ -1704,8 +2131,10 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 18a. GET /api/organization/country-configuration — 4-Step Operating Country Cascade
   app.get('/api/organization/country-configuration', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'organization');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const countryName = (req.query.country as string) || org.operatingCountry || org.country || 'South Africa';
 
     const cascade = executeOperatingCountryCascade(countryName);
@@ -1721,8 +2150,10 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 18b. POST /api/organization/country-configuration — Update Operating Country and execute cascade
   app.post('/api/organization/country-configuration', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const authCtx = authenticateBillingContext(req, res, 'change_billing_info', undefined, 'organization');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const { country } = req.body || {};
 
     if (!country) {
@@ -1939,10 +2370,50 @@ Include actionable next steps or recommendations for the property manager.`;
   // SEQUENCE 21 — PAYMENT PROVIDER INTEGRATION
   // ==========================================
 
+  // Helper: Validates that webhook customer/subscription references strictly belong to the target organization
+  const validateWebhookAccountOwnership = (context: {
+    organizationId: string | null;
+    customerId: string | null;
+    subscriptionId: string | null;
+    invoiceId: string | null;
+  }): { valid: boolean; reason?: string } => {
+    if (!context.organizationId) {
+      return { valid: false, reason: 'Webhook payload missing authoritative organization_id.' };
+    }
+    const targetOrg = initialOrganizations.find((o) => o.id === context.organizationId);
+    if (!targetOrg) {
+      return {
+        valid: false,
+        reason: `Target organization '${context.organizationId}' does not exist in CNTEstates.`,
+      };
+    }
+
+    const expectedCustomerId = targetOrg.subscriptionRecord?.external_customer_id;
+    const expectedSubscriptionId = targetOrg.subscriptionRecord?.external_subscription_id;
+
+    if (context.customerId && expectedCustomerId && context.customerId !== expectedCustomerId) {
+      return {
+        valid: false,
+        reason: `Customer ID '${context.customerId}' does not match organization '${targetOrg.id}' (expected '${expectedCustomerId}').`,
+      };
+    }
+
+    if (context.subscriptionId && expectedSubscriptionId && context.subscriptionId !== expectedSubscriptionId) {
+      return {
+        valid: false,
+        reason: `Subscription ID '${context.subscriptionId}' does not match organization '${targetOrg.id}' (expected '${expectedSubscriptionId}').`,
+      };
+    }
+
+    return { valid: true };
+  };
+
   // 21a. GET /api/payment-provider/status — Provider health & maintained IDs
   app.get('/api/payment-provider/status', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'payment');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const sub = org.subscriptionRecord;
 
     const customerId = sub?.external_customer_id || `cus_stripe_${org.id}`;
@@ -1964,7 +2435,7 @@ Include actionable next steps or recommendations for the property manager.`;
       },
       webhook_listener: {
         endpoint: '/api/payment-provider/webhook',
-        authentication: 'Header stripe-signature or x-webhook-secret',
+        authentication: 'Cryptographic HMAC-SHA256 stripe-signature header',
         timestamp_tolerance_seconds: 300,
         idempotency_enforced: true,
         events_processed_count: getProcessedEventsCount(),
@@ -1974,26 +2445,27 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 21b. POST /api/payment-provider/webhook — Authenticated, Verified, Idempotent, Audited Webhook Handler
+  // 21b. POST /api/payment-provider/webhook — Authenticated, Verified, Account-Isolated, Idempotent, Audited Webhook Handler
   app.post('/api/payment-provider/webhook', (req, res) => {
     const signature =
       (req.headers['stripe-signature'] as string) ||
       (req.headers['x-webhook-signature'] as string) ||
       (req.headers['x-webhook-secret'] as string) ||
-      (req.query.secret as string) ||
       null;
 
     const result = processProviderWebhook({
       rawBody: req.body,
       signatureHeader: signature,
-      secret: DEFAULT_WEBHOOK_SECRET,
-      onEventProcessed: (event, details) => {
-        // Business logic execution
+      secret: SERVER_PAYMENT_WEBHOOK_SECRET,
+      ownershipValidator: validateWebhookAccountOwnership,
+      onEventProcessed: (event) => {
         const dataObj = event.data?.object || {};
-        const orgId = dataObj.organization_id || dataObj.metadata?.organization_id || 'org-1';
-        const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+        const orgId = dataObj.organization_id || dataObj.metadata?.organization_id;
+        // Strict lookup — NEVER fall back to initialOrganizations[0]
+        const org = initialOrganizations.find((o) => o.id === orgId);
+        if (!org || !org.subscriptionRecord) return;
 
-        if (event.type === 'invoice.paid' && org.subscriptionRecord) {
+        if (event.type === 'invoice.paid') {
           const currentEnd = org.subscriptionRecord.current_period_end || new Date().toISOString().slice(0, 10);
           const { periodStart, periodEnd, renewalDate } = calculatePeriodDates(
             currentEnd,
@@ -2007,7 +2479,6 @@ Include actionable next steps or recommendations for the property manager.`;
           org.subscriptionRecord.subscription_status = 'active';
           indexSubscription(org.subscriptionRecord);
 
-          // Add synchronized invoice
           const invId = dataObj.id || `in_stripe_${Date.now()}`;
           const newInvoice = syncProviderInvoice({
             organizationId: org.id,
@@ -2020,12 +2491,12 @@ Include actionable next steps or recommendations for the property manager.`;
           });
           if (!org.subscriptionInvoices) org.subscriptionInvoices = [];
           org.subscriptionInvoices.unshift(newInvoice);
-        } else if (event.type === 'invoice.payment_failed' && org.subscriptionRecord) {
+        } else if (event.type === 'invoice.payment_failed') {
           org.subscriptionRecord.payment_status = 'failed';
           org.subscriptionRecord.subscription_status = 'past_due';
           org.subscriptionRecord.status = 'past_due';
           indexSubscription(org.subscriptionRecord);
-        } else if (event.type === 'customer.subscription.deleted' && org.subscriptionRecord) {
+        } else if (event.type === 'customer.subscription.deleted') {
           org.subscriptionRecord.subscription_status = 'cancelled';
           org.subscriptionRecord.status = 'cancelled';
           org.subscriptionRecord.cancelled_at = new Date().toISOString();
@@ -2037,21 +2508,32 @@ Include actionable next steps or recommendations for the property manager.`;
     return res.status(result.status).json(result.response);
   });
 
-  // 21c. GET /api/payment-provider/webhooks/audit — Webhook Tamper-Evident Audit Trail
-  app.get('/api/payment-provider/webhooks/audit', (_req, res) => {
-    const audits = getWebhookAuditLogs();
+  // 21c. GET /api/payment-provider/webhooks/audit — Account-Scoped Webhook Tamper-Evident Audit Trail
+  app.get('/api/payment-provider/webhooks/audit', (req, res) => {
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'audit_log');
+    if (!authCtx) return;
+
+    const allAudits = getWebhookAuditLogs();
+    const scopedAudits = authCtx.userRole === 'platform_admin'
+      ? allAudits
+      : allAudits.filter((a) => a.affected_organization_id === authCtx.targetOrgId);
+
     return res.json({
       success: true,
       sequence: 'SEQUENCE 21 — WEBHOOK AUDIT TRAIL',
-      total_recorded: audits.length,
-      audits,
+      organization_id: authCtx.targetOrgId,
+      total_recorded: scopedAudits.length,
+      audits: scopedAudits,
     });
   });
 
   // 21d. POST /api/payment-provider/customers — Customer Creation maintaining provider IDs
   app.post('/api/payment-provider/customers', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body?.organization_id || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const requestedOrgId = (req.headers['x-organization-id'] as string) || req.body?.organization_id;
+    const authCtx = authenticateBillingContext(req, res, 'change_billing_info', requestedOrgId, 'payment');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const { email, currency, payment_method } = req.body || {};
 
     const { customer, isNew } = getOrCreateProviderCustomer({
@@ -2077,8 +2559,11 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 21e. POST /api/payment-provider/subscriptions — Subscription Creation with provider IDs
   app.post('/api/payment-provider/subscriptions', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body?.organization_id || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const requestedOrgId = (req.headers['x-organization-id'] as string) || req.body?.organization_id;
+    const authCtx = authenticateBillingContext(req, res, 'change_plans', requestedOrgId, 'subscription');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const { plan_id, billing_period, billing_currency } = req.body || {};
 
     const result = createProviderSubscription({
@@ -2112,8 +2597,10 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 21f. POST /api/payment-provider/subscriptions/:id/change — Subscription changes maintaining provider IDs
   app.post('/api/payment-provider/subscriptions/:id/change', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const authCtx = authenticateBillingContext(req, res, 'change_plans', undefined, 'subscription');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
 
     if (!org.subscriptionRecord) {
       return res.status(404).json({ error: 'No subscription record found' });
@@ -2131,7 +2618,6 @@ Include actionable next steps or recommendations for the property manager.`;
       billingCurrency: billing_currency,
     });
 
-    // Update in-memory organization subscription record
     org.subscriptionRecord.plan_id = target_plan_id;
     if (billing_period) org.subscriptionRecord.billing_period = billing_period;
     if (billing_currency) org.subscriptionRecord.billing_currency = billing_currency;
@@ -2152,24 +2638,27 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 21g. POST /api/payment-provider/invoices/sync — Invoice synchronization
   app.post('/api/payment-provider/invoices/sync', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const authCtx = authenticateBillingContext(req, res, 'change_billing_info', undefined, 'invoice');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
 
     if (!org.subscriptionRecord) {
       return res.status(404).json({ error: 'No active subscription found' });
     }
 
-    const { provider_invoice_id, amount, currency, status } = req.body || {};
+    const { provider_invoice_id, currency } = req.body || {};
     const invId = provider_invoice_id || `in_stripe_sync_${Date.now().toString().slice(-6)}`;
 
+    // Authoritative price & status computed server-side from subscription record (never trusting frontend payment_status/amount)
     const syncedInvoice = syncProviderInvoice({
       organizationId: org.id,
       organizationName: org.name,
       subscription: org.subscriptionRecord,
       providerInvoiceId: invId,
-      amount: amount !== undefined ? Number(amount) : org.subscriptionRecord.current_price,
+      amount: org.subscriptionRecord.current_price,
       currency: currency || org.subscriptionRecord.billing_currency || 'ZAR',
-      status: status || 'paid',
+      status: 'open',
     });
 
     if (!org.subscriptionInvoices) org.subscriptionInvoices = [];
@@ -2187,22 +2676,36 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 21h. POST /api/payment-provider/simulate-event — Webhook simulation sandbox
+  // 21h. POST /api/payment-provider/simulate-event — Authenticated server-side webhook sandbox (zero client secret exposure)
   app.post('/api/payment-provider/simulate-event', (req, res) => {
-    const { event_type, organization_id, customer_id, subscription_id } = req.body || {};
+    const requestedOrgId = (req.headers['x-organization-id'] as string) || req.body?.organization_id;
+    const authCtx = authenticateBillingContext(req, res, 'change_billing_info', requestedOrgId, 'payment');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
+    const {
+      event_type,
+      event_id,
+      customer_id,
+      subscription_id,
+      force_invalid_signature,
+      timestamp_age_seconds,
+    } = req.body || {};
     const type = event_type || 'invoice.paid';
-    const orgId = organization_id || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const createdTs = nowUnix - (Number(timestamp_age_seconds) || 0);
 
     const eventPayload: WebhookEventPayload = {
-      id: `evt_sim_${Date.now()}`,
+      id: event_id || `evt_sim_${Date.now()}`,
       object: 'event',
       api_version: '2026-09-01',
-      created: Math.floor(Date.now() / 1000),
+      created: createdTs,
       type,
       data: {
         object: {
-          id: type.startsWith('invoice') ? `in_stripe_sim_${Date.now()}` : (subscription_id || org.subscriptionRecord?.external_subscription_id || `sub_stripe_${org.id}`),
+          id: type.startsWith('invoice')
+            ? `in_stripe_sim_${Date.now()}`
+            : (subscription_id || org.subscriptionRecord?.external_subscription_id || `sub_stripe_${org.id}`),
           customer: customer_id || org.subscriptionRecord?.external_customer_id || `cus_stripe_${org.id}`,
           subscription: subscription_id || org.subscriptionRecord?.external_subscription_id || `sub_stripe_${org.id}`,
           organization_id: org.id,
@@ -2214,14 +2717,20 @@ Include actionable next steps or recommendations for the property manager.`;
       },
     };
 
+    const computedSignature = force_invalid_signature
+      ? 't=1700000000,v1=0000000000000000000000000000000000000000000000000000000000000000'
+      : computeWebhookSignatureHeader(eventPayload, SERVER_PAYMENT_WEBHOOK_SECRET, createdTs);
+
     const result = processProviderWebhook({
       rawBody: eventPayload,
-      signatureHeader: DEFAULT_WEBHOOK_SECRET,
-      secret: DEFAULT_WEBHOOK_SECRET,
+      signatureHeader: computedSignature,
+      secret: SERVER_PAYMENT_WEBHOOK_SECRET,
+      ownershipValidator: validateWebhookAccountOwnership,
     });
 
-    return res.json({
+    return res.status(result.status).json({
       success: result.success,
+      http_status: result.status,
       simulated_event: eventPayload,
       audit: result.auditEntry,
       result: result.response,
@@ -2230,8 +2739,10 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 8. POST /api/subscription/cancel — Schedule cancellation at period end
   app.post('/api/subscription/cancel', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const authCtx = authenticateBillingContext(req, res, 'cancel', undefined, 'subscription');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
 
     if (!org.subscriptionRecord) {
       return res.status(404).json({ error: 'No active subscription found for organization' });
@@ -2254,7 +2765,7 @@ Include actionable next steps or recommendations for the property manager.`;
       org.id,
       previousSub,
       org.subscriptionRecord,
-      (req.headers['x-user-id'] as string) || 'admin'
+      authCtx.userId
     );
     subscriptionAuditTrail.unshift(auditEntry);
 
@@ -2267,8 +2778,10 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 9. POST /api/subscription/reactivate — Re-enable auto-renewal
   app.post('/api/subscription/reactivate', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
+    const authCtx = authenticateBillingContext(req, res, 'reactivate', undefined, 'subscription');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
 
     if (!org.subscriptionRecord) {
       return res.status(404).json({ error: 'No active subscription found for organization' });
@@ -2291,7 +2804,7 @@ Include actionable next steps or recommendations for the property manager.`;
       org.id,
       previousSub,
       org.subscriptionRecord,
-      (req.headers['x-user-id'] as string) || 'admin'
+      authCtx.userId
     );
     subscriptionAuditTrail.unshift(auditEntry);
 
@@ -2302,13 +2815,17 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 10. GET /api/subscription/tenant/:targetOrgId — Enforces tenant isolation
+  // 10. GET /api/subscription/tenant/:targetOrgId — Enforces verified auth + strict tenant isolation
   app.get('/api/subscription/tenant/:targetOrgId', (req, res) => {
-    const requestingOrgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const userRole = (req.headers['x-user-role'] as string) || 'property_manager';
     const targetOrgId = req.params.targetOrgId;
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', targetOrgId, 'subscription');
+    if (!authCtx) return;
 
-    const access = getSubscriptionWithTenantIsolation(requestingOrgId, targetOrgId, userRole);
+    const access = getSubscriptionWithTenantIsolation(
+      authCtx.requestingOrgId,
+      targetOrgId,
+      authCtx.userRole
+    );
     if (!access.success) {
       return res.status(403).json({ error: access.error });
     }
@@ -2319,14 +2836,14 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 11. GET /api/subscription/audit-trail — Retrieve subscription audit logs
+  // 11. GET /api/subscription/audit-trail — Retrieve account-isolated subscription audit logs
   app.get('/api/subscription/audit-trail', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const userRole = (req.headers['x-user-role'] as string) || 'property_manager';
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'audit_log');
+    if (!authCtx) return;
 
-    const logs = userRole === 'platform_admin'
+    const logs = authCtx.userRole === 'platform_admin'
       ? subscriptionAuditTrail
-      : subscriptionAuditTrail.filter((l) => l.organizationId === orgId);
+      : subscriptionAuditTrail.filter((l) => l.organizationId === authCtx.targetOrgId);
 
     return res.json({
       total: logs.length,
@@ -2334,7 +2851,7 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 12. POST /api/subscription/lifecycle/:event — Execute subscription lifecycle transitions
+  // 12. POST /api/subscription/lifecycle/:event — Execute verified subscription lifecycle transitions
   app.post('/api/subscription/lifecycle/:event', (req, res) => {
     const rawEvent = (req.params.event || '').toLowerCase();
     const eventAliases: Record<string, SubscriptionLifecycleEvent> = {
@@ -2363,27 +2880,25 @@ Include actionable next steps or recommendations for the property manager.`;
       });
     }
 
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
-
-    // SEQUENCE 28: RBAC check for lifecycle transitions
     let requiredPerm: BillingPermission = 'change_plans';
     if (event === 'cancellation') requiredPerm = 'cancel';
     else if (event === 'reactivation') requiredPerm = 'reactivate';
     else if (event === 'upgrade') requiredPerm = 'upgrade';
     else if (event === 'downgrade') requiredPerm = 'downgrade';
 
-    if (!checkBillingRbac(req, res, requiredPerm, `lifecycle_${event}`)) {
-      return;
-    }
+    const requestedOrgId = (req.headers['x-organization-id'] as string) || req.body?.organizationId;
+    const authCtx = authenticateBillingContext(req, res, requiredPerm, requestedOrgId, 'subscription');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
 
     if (!org.subscriptionRecord) {
-      return res.status(404).json({ error: `No active subscription found for organization '${orgId}'` });
+      return res.status(404).json({ error: `No active subscription found for organization '${org.id}'` });
     }
 
     const previousSub = { ...org.subscriptionRecord };
     const { targetPlanId, billingPeriod, billingCurrency, reason, immediate } = req.body;
-    const initiatedBy = (req.headers['x-user-id'] as string) || 'property_manager';
+    const initiatedBy = authCtx.userId;
 
     const result = transitionSubscriptionLifecycle(event, {
       subscription: org.subscriptionRecord,
@@ -2407,7 +2922,6 @@ Include actionable next steps or recommendations for the property manager.`;
     org.monthlySpend = result.subscription.current_price;
     org.renewalDate = result.subscription.renewal_date;
 
-    // Record audit log entry
     const auditEntry = createSubscriptionAuditEntry(
       'LIFECYCLE',
       result.subscription.subscription_id,
@@ -2426,28 +2940,6 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 13. GET /api/subscription/history — Immutable subscription history (never deleted)
-  app.get('/api/subscription/history', (req, res) => {
-    const requestingOrgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const userRole = (req.headers['x-user-role'] as string) || 'property_manager';
-    const targetOrgId = (req.query.organizationId as string) || requestingOrgId;
-
-    if (userRole !== 'platform_admin' && requestingOrgId !== targetOrgId) {
-      return res.status(403).json({
-        error: `Security Tenant Isolation Violation: Cannot view subscription history for organization '${targetOrgId}'`,
-      });
-    }
-
-    const history = getSubscriptionHistory({ organizationId: targetOrgId });
-
-    return res.json({
-      success: true,
-      organization_id: targetOrgId,
-      total_history_records: history.length,
-      history,
-    });
-  });
-
   // 14. GET /api/capacity/limits — Authoritative subscription capacity limits
   app.get('/api/capacity/limits', (_req, res) => {
     return res.json({
@@ -2456,17 +2948,14 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 15. GET /api/capacity/usage — Live capacity consumption metrics
+  // 15. GET /api/capacity/usage — Live account-isolated capacity consumption metrics
   app.get('/api/capacity/usage', (req, res) => {
-    const requestingOrgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const targetOrgId = (req.query.organizationId as string) || requestingOrgId;
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'usage');
+    if (!authCtx) return;
 
-    if (!checkTenantBoundary(req, res, targetOrgId, 'usage', 'read_capacity_usage')) {
-      return;
-    }
-
-    const org = initialOrganizations.find((o) => o.id === targetOrgId) || initialOrganizations[0];
-    const planId = (req.headers['x-plan-id'] as string) || (req.query.planId as string) || org.planId;
+    const org = authCtx.org;
+    const targetOrgId = authCtx.targetOrgId;
+    const planId = org.planId;
     const orgProperties = serverProperties.filter((p) => p.organizationId === targetOrgId);
     const orgUnits = serverUnits.filter((u) => {
       const prop = orgProperties.find((p) => p.id === u.propertyId);
@@ -2488,12 +2977,14 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 16. POST /api/capacity/validate-property — Preflight check for adding property
   app.post('/api/capacity/validate-property', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
-    const planId = req.body.planId || (req.headers['x-plan-id'] as string) || (req.query.planId as string) || org.planId;
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'usage');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
+    const planId = org.planId;
     const currentCount = typeof req.body.currentCount === 'number'
       ? req.body.currentCount
-      : serverProperties.filter((p) => p.organizationId === orgId).length;
+      : serverProperties.filter((p) => p.organizationId === org.id).length;
 
     const validation = validateAddProperty(planId, currentCount);
     return res.json({
@@ -2504,15 +2995,14 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 17. POST /api/capacity/validate-unit — Preflight check for adding unit
   app.post('/api/capacity/validate-unit', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'usage');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
     const { propertyId } = req.body;
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
-    const planId = req.body.planId || (req.headers['x-plan-id'] as string) || (req.query.planId as string) || org.planId;
-    const orgProperties = req.body.properties || serverProperties.filter((p) => p.organizationId === orgId);
-    const orgUnits = req.body.allUnits || serverUnits.filter((u) => {
-      const prop = orgProperties.find((p: any) => p.id === u.propertyId);
-      return Boolean(prop);
-    });
+    const planId = org.planId;
+    const orgProperties = serverProperties.filter((p) => p.organizationId === org.id);
+    const orgUnits = serverUnits.filter((u) => orgProperties.some((p: any) => p.id === u.propertyId));
 
     const validation = validateAddUnit({
       planId,
@@ -2527,20 +3017,23 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 18. GET /api/properties & POST /api/properties — Backend capacity enforcement
+  // 18. GET /api/properties & POST /api/properties — Verified account-isolated capacity enforcement
   app.get('/api/properties', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || (req.query.organizationId as string) || 'org-1';
-    const properties = serverProperties.filter((p) => p.organizationId === orgId);
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'organization');
+    if (!authCtx) return;
+
+    const properties = serverProperties.filter((p) => p.organizationId === authCtx.targetOrgId);
     return res.json({ success: true, count: properties.length, properties });
   });
 
   app.post('/api/properties', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
-    const planId = (req.headers['x-plan-id'] as string) || req.body.planId || org.planId;
-    const orgProperties = serverProperties.filter((p) => p.organizationId === orgId);
+    const authCtx = authenticateBillingContext(req, res, 'change_billing_info', undefined, 'organization');
+    if (!authCtx) return;
 
-    // Strict Backend Capacity Enforcement
+    const org = authCtx.org;
+    const planId = org.planId;
+    const orgProperties = serverProperties.filter((p) => p.organizationId === org.id);
+
     const validation = validateAddProperty(planId, orgProperties.length);
     if (!validation.allowed) {
       return res.status(403).json({
@@ -2556,7 +3049,7 @@ Include actionable next steps or recommendations for the property manager.`;
     const newProperty = {
       ...req.body,
       id: req.body.id || `prop-${Date.now()}`,
-      organizationId: orgId,
+      organizationId: org.id,
     };
     serverProperties.push(newProperty);
 
@@ -2567,28 +3060,33 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 19. GET /api/units & POST /api/units — Backend capacity enforcement (including Professional per-property check)
+  // 19. GET /api/units & POST /api/units — Verified account-isolated capacity enforcement
   app.get('/api/units', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || (req.query.organizationId as string) || 'org-1';
-    const orgProperties = serverProperties.filter((p) => p.organizationId === orgId);
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'organization');
+    if (!authCtx) return;
+
+    const orgProperties = serverProperties.filter((p) => p.organizationId === authCtx.targetOrgId);
     const units = serverUnits.filter((u) => orgProperties.some((p) => p.id === u.propertyId));
     return res.json({ success: true, count: units.length, units });
   });
 
   app.post('/api/units', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
-    const planId = (req.headers['x-plan-id'] as string) || req.body.planId || org.planId;
-    const orgProperties = serverProperties.filter((p) => p.organizationId === orgId);
+    const authCtx = authenticateBillingContext(req, res, 'change_billing_info', undefined, 'organization');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
+    const planId = org.planId;
+    const orgProperties = serverProperties.filter((p) => p.organizationId === org.id);
     const orgUnits = serverUnits.filter((u) => orgProperties.some((p) => p.id === u.propertyId));
 
     const propertyId = req.body.propertyId;
     if (!propertyId) {
       return res.status(400).json({ error: 'propertyId is required to associate and validate unit capacity' });
     }
+    if (!orgProperties.some((p) => p.id === propertyId)) {
+      return res.status(403).json({ error: 'TENANT_ISOLATION_VIOLATION: Property does not belong to your organization.' });
+    }
 
-    // Strict Backend Capacity Enforcement
-    // For Professional: specifically enforces 60 units per property
     const validation = validateAddUnit({
       planId,
       propertyId,
@@ -2611,6 +3109,7 @@ Include actionable next steps or recommendations for the property manager.`;
     const newUnit = {
       ...req.body,
       id: req.body.id || `unit-${Date.now()}`,
+      organizationId: org.id,
     };
     serverUnits.push(newUnit);
 
@@ -2625,17 +3124,14 @@ Include actionable next steps or recommendations for the property manager.`;
   // SEQUENCE 08 — CENTRALIZED USAGE MONITORING
   // ==========================================
 
-  // 20. GET /api/usage/monitoring — Returns centralized usage calculations & status
+  // 20. GET /api/usage/monitoring — Returns account-isolated centralized usage calculations & status
   app.get('/api/usage/monitoring', (req, res) => {
-    const requestingOrgId = (req.headers['x-organization-id'] as string) || 'org-1';
-    const targetOrgId = (req.query.organizationId as string) || requestingOrgId;
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'usage');
+    if (!authCtx) return;
 
-    if (!checkTenantBoundary(req, res, targetOrgId, 'usage', 'read_usage_monitoring')) {
-      return;
-    }
-
-    const org = initialOrganizations.find((o) => o.id === targetOrgId) || initialOrganizations[0];
-    const planId = (req.headers['x-plan-id'] as string) || (req.query.planId as string) || org.planId;
+    const org = authCtx.org;
+    const targetOrgId = authCtx.targetOrgId;
+    const planId = org.planId;
     const scenario = (req.query.scenario as any) || null;
 
     const orgProperties = serverProperties.filter((p) => p.organizationId === targetOrgId);
@@ -2663,12 +3159,14 @@ Include actionable next steps or recommendations for the property manager.`;
 
   // 21. POST /api/usage/validate-resource — Validates adding any plan-controlled resource
   app.post('/api/usage/validate-resource', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
-    const planId = req.body.planId || (req.headers['x-plan-id'] as string) || org.planId;
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'usage');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
+    const planId = org.planId;
     const { resourceKey, currentCount, propertyId } = req.body;
 
-    const orgProperties = serverProperties.filter((p) => p.organizationId === orgId);
+    const orgProperties = serverProperties.filter((p) => p.organizationId === org.id);
     const orgUnits = serverUnits.filter((u) => orgProperties.some((p) => p.id === u.propertyId));
 
     const result = validateResourceCapacity({
@@ -2686,19 +3184,23 @@ Include actionable next steps or recommendations for the property manager.`;
     });
   });
 
-  // 22. GET /api/buildings & POST /api/buildings — Backend Building Capacity Enforcement
+  // 22. GET /api/buildings & POST /api/buildings — Verified Account-Isolated Building Capacity Enforcement
   app.get('/api/buildings', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || (req.query.organizationId as string) || 'org-1';
-    const orgProperties = serverProperties.filter((p) => p.organizationId === orgId);
+    const authCtx = authenticateBillingContext(req, res, 'view_billing', undefined, 'organization');
+    if (!authCtx) return;
+
+    const orgProperties = serverProperties.filter((p) => p.organizationId === authCtx.targetOrgId);
     const buildings = serverBuildings.filter((b) => orgProperties.some((p) => p.id === b.propertyId));
     return res.json({ success: true, count: buildings.length, buildings });
   });
 
   app.post('/api/buildings', (req, res) => {
-    const orgId = (req.headers['x-organization-id'] as string) || req.body.organizationId || 'org-1';
-    const org = initialOrganizations.find((o) => o.id === orgId) || initialOrganizations[0];
-    const planId = (req.headers['x-plan-id'] as string) || req.body.planId || org.planId;
-    const orgProperties = serverProperties.filter((p) => p.organizationId === orgId);
+    const authCtx = authenticateBillingContext(req, res, 'change_billing_info', undefined, 'organization');
+    if (!authCtx) return;
+
+    const org = authCtx.org;
+    const planId = org.planId;
+    const orgProperties = serverProperties.filter((p) => p.organizationId === org.id);
     const orgBuildings = serverBuildings.filter((b) => orgProperties.some((p) => p.id === b.propertyId));
 
     const validation = validateAddBuilding(planId, orgBuildings.length);
@@ -2716,6 +3218,7 @@ Include actionable next steps or recommendations for the property manager.`;
     const newBuilding = {
       ...req.body,
       id: req.body.id || `bld-${Date.now()}`,
+      organizationId: org.id,
     };
     serverBuildings.push(newBuilding);
 

@@ -1,5 +1,7 @@
 import React from 'react';
 import { useApp } from '../context/AppContext';
+import { useFirebase } from '../context/FirebaseContext';
+import { getRoleNavigationPolicy } from '../services/rbacNavigationPolicy';
 import {
   LayoutDashboard,
   Building,
@@ -67,8 +69,11 @@ export const Sidebar: React.FC<{ isMobileOpen?: boolean; closeMobile?: () => voi
     userRole,
     canPerformBillingAction,
   } = useApp();
+  const { userRoleCategory, isPlatformAdmin } = useFirebase();
 
-  const isBillingAllowed = canPerformBillingAction('view_billing');
+  const effectiveRole = isPlatformAdmin ? 'platform_admin' : userRoleCategory || userRole;
+  const navPolicy = getRoleNavigationPolicy(effectiveRole, isPlatformAdmin);
+  const isBillingAllowed = navPolicy.canViewBilling && canPerformBillingAction('view_billing');
 
   const openTicketsCount = tickets.filter((t) => t.status !== 'closed' && t.status !== 'completed').length;
   const criticalTicketsCount = tickets.filter(
@@ -190,9 +195,40 @@ export const Sidebar: React.FC<{ isMobileOpen?: boolean; closeMobile?: () => voi
         { id: 'databaseMigration', label: 'Database Migrations', icon: Database, isHighlight: true },
         { id: 'tenantSecurity', label: 'Multi-Tenant Security', icon: ShieldCheck, isHighlight: true },
         { id: 'billingRbac', label: 'Billing RBAC Security', icon: KeyRound, isHighlight: true },
+        { id: 'accountSecurity', label: 'Account & Linked Providers', icon: KeyRound },
         { id: 'settings', label: t.nav.settings, icon: Settings },
       ],
     },
+  ];
+
+  // Role-specific dedicated portal entries when user is scoped to Tenant, Contractor, or Technician
+  const rolePortalGroup: NavGroup | null =
+    effectiveRole === 'tenant'
+      ? {
+          title: 'Tenant Portal',
+          items: [{ id: 'tenantPortal', label: 'My Residence & Leases', icon: Home, isHighlight: true }],
+        }
+      : effectiveRole === 'contractor'
+      ? {
+          title: 'Contractor Portal',
+          items: [{ id: 'contractorPortal', label: 'Assigned Jobs & RFQs', icon: HardHat, isHighlight: true }],
+        }
+      : effectiveRole === 'technician'
+      ? {
+          title: 'Technician Workspace',
+          items: [{ id: 'technicianView', label: 'Field Tasks & Logs', icon: Smartphone, isHighlight: true }],
+        }
+      : null;
+
+  // Strictly enforce UI-level RBAC isolation by filtering unauthorized tabs and empty groups
+  const visibleNavGroups: NavGroup[] = [
+    ...(rolePortalGroup ? [rolePortalGroup] : []),
+    ...navGroups
+      .map((group) => ({
+        ...group,
+        items: group.items.filter((item) => navPolicy.allowedTabs.has(item.id)),
+      }))
+      .filter((group) => group.items.length > 0),
   ];
 
   const handleTabClick = (tabId: string) => {
@@ -228,65 +264,75 @@ export const Sidebar: React.FC<{ isMobileOpen?: boolean; closeMobile?: () => voi
           </div>
         </div>
 
-        {/* Dedicated Portals Quick Bar */}
-        <div className="p-3 border-b border-slate-800/80 bg-slate-900/60">
-          <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 px-1">
-            Dedicated Views
+        {/* Dedicated Portals Quick Bar (Strictly scoped to authorized portals only) */}
+        {navPolicy.allowedPortals.size > 1 && (
+          <div className="p-3 border-b border-slate-800/80 bg-slate-900/60">
+            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1.5 px-1">
+              Dedicated Views
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {navPolicy.allowedPortals.has('tenantPortal') && (
+                <button
+                  onClick={() => handleTabClick('tenantPortal')}
+                  className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
+                    activeTab === 'tenantPortal'
+                      ? 'bg-emerald-600 text-white font-medium'
+                      : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
+                  }`}
+                >
+                  <Home className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
+                  <span className="truncate">Tenant App</span>
+                </button>
+              )}
+
+              {navPolicy.allowedPortals.has('contractorPortal') && (
+                <button
+                  onClick={() => handleTabClick('contractorPortal')}
+                  className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
+                    activeTab === 'contractorPortal'
+                      ? 'bg-amber-600 text-white font-medium'
+                      : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
+                  }`}
+                >
+                  <HardHat className="w-3.5 h-3.5 shrink-0 text-amber-400" />
+                  <span className="truncate">Contractor</span>
+                </button>
+              )}
+
+              {navPolicy.allowedPortals.has('technicianView') && (
+                <button
+                  onClick={() => handleTabClick('technicianView')}
+                  className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
+                    activeTab === 'technicianView'
+                      ? 'bg-blue-600 text-white font-medium'
+                      : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
+                  }`}
+                >
+                  <Smartphone className="w-3.5 h-3.5 shrink-0 text-blue-400" />
+                  <span className="truncate">Technician</span>
+                </button>
+              )}
+
+              {navPolicy.allowedPortals.has('platformAdmin') && (
+                <button
+                  onClick={() => handleTabClick('platformAdmin')}
+                  className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
+                    activeTab === 'platformAdmin'
+                      ? 'bg-purple-600 text-white font-medium'
+                      : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
+                  }`}
+                >
+                  <Server className="w-3.5 h-3.5 shrink-0 text-purple-400" />
+                  <span className="truncate">SaaS Admin</span>
+                </button>
+              )}
+            </div>
           </div>
-          <div className="grid grid-cols-2 gap-1.5">
-            <button
-              onClick={() => handleTabClick('tenantPortal')}
-              className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
-                activeTab === 'tenantPortal'
-                  ? 'bg-emerald-600 text-white font-medium'
-                  : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
-              }`}
-            >
-              <Home className="w-3.5 h-3.5 shrink-0 text-emerald-400" />
-              <span className="truncate">Tenant App</span>
-            </button>
-
-            <button
-              onClick={() => handleTabClick('contractorPortal')}
-              className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
-                activeTab === 'contractorPortal'
-                  ? 'bg-amber-600 text-white font-medium'
-                  : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
-              }`}
-            >
-              <HardHat className="w-3.5 h-3.5 shrink-0 text-amber-400" />
-              <span className="truncate">Contractor</span>
-            </button>
-
-            <button
-              onClick={() => handleTabClick('technicianView')}
-              className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
-                activeTab === 'technicianView'
-                  ? 'bg-blue-600 text-white font-medium'
-                  : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
-              }`}
-            >
-              <Smartphone className="w-3.5 h-3.5 shrink-0 text-blue-400" />
-              <span className="truncate">Technician</span>
-            </button>
-
-            <button
-              onClick={() => handleTabClick('platformAdmin')}
-              className={`flex items-center gap-1.5 px-2 py-1.5 text-xs rounded transition-colors ${
-                activeTab === 'platformAdmin'
-                  ? 'bg-purple-600 text-white font-medium'
-                  : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
-              }`}
-            >
-              <Server className="w-3.5 h-3.5 shrink-0 text-purple-400" />
-              <span className="truncate">SaaS Admin</span>
-            </button>
-          </div>
-        </div>
+        )}
 
         {/* Scrollable Navigation Tree */}
         <div className="flex-1 overflow-y-auto py-3 px-2 space-y-4 text-xs scrollbar-thin scrollbar-thumb-slate-800">
-          {navGroups.map((group, gIdx) => (
+          {visibleNavGroups.map((group, gIdx) => (
             <div key={gIdx} className="space-y-0.5">
               <div className="px-2.5 py-1 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
                 {group.title}

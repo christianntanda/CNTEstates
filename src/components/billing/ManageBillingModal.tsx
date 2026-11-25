@@ -14,6 +14,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { authenticatedFetch } from '../../utils/authFetch';
 import { currencyCatalogue, formatSubscriptionPrice } from '../../services/currencyService';
 import { getAllBillingPeriods, formatBillingCadenceLabel } from '../../services/billingPeriodService';
 import { BillingPeriod, CustomBillingSchedule } from '../../types';
@@ -75,7 +76,7 @@ export const ManageBillingModal: React.FC<ManageBillingModalProps> = ({
 
     try {
       // Send to payment provider customer update endpoint
-      const res = await fetch('/api/payment-provider/customers', {
+      const res = await authenticatedFetch('/api/payment-provider/customers', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

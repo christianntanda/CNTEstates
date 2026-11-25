@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../context/AppContext';
+import { useFirebase } from '../context/FirebaseContext';
 import { Language, Currency, UserRole } from '../types';
 import { currencyCatalogue, getExchangeRate } from '../services/currencyService';
 import { CurrencySelectorModal } from './currency/CurrencySelectorModal';
@@ -18,6 +19,9 @@ import {
   ChevronDown,
   ArrowRightLeft,
   Settings2,
+  LogIn,
+  LogOut,
+  Cloud,
 } from 'lucide-react';
 
 export const Header: React.FC = () => {
@@ -45,10 +49,23 @@ export const Header: React.FC = () => {
     setSelectedPropertyId,
   } = useApp();
 
+  const {
+    firebaseUser,
+    authReady,
+    authLoading,
+    authError,
+    syncStatus,
+    isPlatformAdmin,
+    signInWithGoogle,
+    signOutUser,
+    clearAuthError,
+  } = useFirebase();
+
   const [showNotifications, setShowNotifications] = useState(false);
   const [showRoleMenu, setShowRoleMenu] = useState(false);
   const [showLangMenu, setShowLangMenu] = useState(false);
   const [showCurrencyMenu, setShowCurrencyMenu] = useState(false);
+  const [showAccountMenu, setShowAccountMenu] = useState(false);
   const [currencyModalConfig, setCurrencyModalConfig] = useState<{
     isOpen: boolean;
     mode: 'user_display' | 'organization_base';
@@ -168,35 +185,47 @@ export const Header: React.FC = () => {
 
         {/* Right Action Controls */}
         <div className="flex items-center gap-2 sm:gap-3">
-          {/* Persona / Role Quick Switcher */}
+          {/* Role Badge / Platform Admin Persona Switcher */}
           <div className="relative">
-            <button
-              onClick={() => setShowRoleMenu(!showRoleMenu)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-md text-xs font-medium text-slate-200 transition-colors"
-              title="Switch user persona to test specific portal workflows"
-            >
-              <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="hidden sm:inline">{roleLabels[userRole]}</span>
-              <ChevronDown className="w-3 h-3 text-slate-400" />
-            </button>
+            {isPlatformAdmin ? (
+              <>
+                <button
+                  onClick={() => setShowRoleMenu(!showRoleMenu)}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-md text-xs font-medium text-slate-200 transition-colors"
+                  title="Platform Administrator role view switcher"
+                >
+                  <UserCheck className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="hidden sm:inline">{roleLabels[userRole]}</span>
+                  <ChevronDown className="w-3 h-3 text-slate-400" />
+                </button>
 
-            {showRoleMenu && (
-              <div className="absolute right-0 mt-2 w-56 bg-slate-800 border border-slate-700 rounded-lg shadow-xl py-1 z-50">
-                <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider border-b border-slate-700/60">
-                  Select User Persona
-                </div>
-                {(Object.keys(roleLabels) as UserRole[]).map((r) => (
-                  <button
-                    key={r}
-                    onClick={() => handleRoleChange(r)}
-                    className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between hover:bg-slate-700 ${
-                      userRole === r ? 'text-emerald-400 font-semibold bg-slate-700/40' : 'text-slate-300'
-                    }`}
-                  >
-                    <span>{roleLabels[r]}</span>
-                    {userRole === r && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
-                  </button>
-                ))}
+                {showRoleMenu && (
+                  <div className="absolute right-0 mt-2 w-56 bg-slate-800 border border-slate-700 rounded-lg shadow-xl py-1 z-50">
+                    <div className="px-3 py-1.5 text-[11px] font-semibold text-slate-400 uppercase tracking-wider border-b border-slate-700/60">
+                      Admin Role Preview
+                    </div>
+                    {(Object.keys(roleLabels) as UserRole[]).map((r) => (
+                      <button
+                        key={r}
+                        onClick={() => handleRoleChange(r)}
+                        className={`w-full text-left px-3 py-1.5 text-xs flex items-center justify-between hover:bg-slate-700 ${
+                          userRole === r ? 'text-emerald-400 font-semibold bg-slate-700/40' : 'text-slate-300'
+                        }`}
+                      >
+                        <span>{roleLabels[r]}</span>
+                        {userRole === r && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div
+                className="flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-900 border border-slate-800 rounded-md text-xs font-medium text-slate-300"
+                title="Your verified CNTEstates account role"
+              >
+                <Shield className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="hidden sm:inline">{roleLabels[userRole]}</span>
               </div>
             )}
           </div>
@@ -468,26 +497,144 @@ export const Header: React.FC = () => {
             )}
           </div>
 
-          {/* User Profile Avatar */}
-          <div
-            className="flex items-center gap-2 pl-2 border-l border-slate-800 cursor-pointer"
-            onClick={() => setActiveTab('settings')}
-            title="User Settings"
-          >
-            {currentUser.avatarUrl ? (
-              <img
-                src={currentUser.avatarUrl}
-                alt={currentUser.name}
-                className="w-7 h-7 rounded-full object-cover ring-1 ring-emerald-500/50"
-              />
+          {/* Firebase Google Auth & User Profile */}
+          <div className="relative pl-2 border-l border-slate-800 flex items-center gap-2">
+            {authReady && firebaseUser ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => setShowAccountMenu((prev) => !prev)}
+                  className="flex items-center gap-2 px-2 py-1 rounded-md hover:bg-slate-800 transition-colors"
+                  title={firebaseUser.email || 'Account'}
+                >
+                  {firebaseUser.photoURL ? (
+                    <img
+                      src={firebaseUser.photoURL}
+                      alt={firebaseUser.displayName || 'User'}
+                      referrerPolicy="no-referrer"
+                      className="w-7 h-7 rounded-full object-cover ring-1 ring-emerald-500/60"
+                    />
+                  ) : (
+                    <div className="w-7 h-7 rounded-full bg-emerald-600 flex items-center justify-center text-xs font-bold text-white">
+                      {(firebaseUser.displayName || firebaseUser.email || 'U').charAt(0).toUpperCase()}
+                    </div>
+                  )}
+                  <span className="hidden xl:inline text-xs font-medium text-slate-200 truncate max-w-[110px]">
+                    {firebaseUser.displayName || firebaseUser.email?.split('@')[0]}
+                  </span>
+                  <ChevronDown className="w-3 h-3 text-slate-400 hidden xl:inline" />
+                </button>
+
+                {showAccountMenu && (
+                  <div className="absolute right-0 top-full mt-2 w-64 bg-slate-900 border border-slate-700 rounded-lg shadow-2xl py-2 z-50">
+                    <div className="px-3 py-2 border-b border-slate-800">
+                      <p className="text-xs font-semibold text-white truncate">
+                        {firebaseUser.displayName || 'Authenticated User'}
+                      </p>
+                      <p className="text-[11px] text-slate-400 truncate mt-0.5">
+                        {firebaseUser.email}
+                      </p>
+                      <div className="flex items-center gap-1.5 mt-2 text-[10px] text-emerald-400">
+                        <Cloud className="w-3 h-3" />
+                        <span>
+                          {syncStatus === 'syncing'
+                            ? 'Syncing to Firestore...'
+                            : syncStatus === 'error'
+                            ? 'Sync paused'
+                            : 'Cloud workspace connected'}
+                        </span>
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowAccountMenu(false);
+                        setActiveTab('accountSecurity');
+                      }}
+                      className="w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-slate-800 flex items-center gap-2 transition-colors"
+                    >
+                      <Shield className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Account Security &amp; Linked Providers</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowAccountMenu(false);
+                        setActiveTab('settings');
+                      }}
+                      className="w-full px-3 py-2 text-left text-xs text-slate-200 hover:bg-slate-800 flex items-center gap-2 transition-colors"
+                    >
+                      <Settings2 className="w-3.5 h-3.5 text-slate-400" />
+                      <span>Organization &amp; Profile Settings</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={authLoading}
+                      onClick={async () => {
+                        setShowAccountMenu(false);
+                        await signOutUser();
+                        setActiveTab('marketingPage');
+                      }}
+                      className="w-full px-3 py-2 text-left text-xs text-red-300 hover:bg-slate-800 flex items-center gap-2 transition-colors disabled:opacity-50"
+                    >
+                      <LogOut className="w-3.5 h-3.5 text-red-400" />
+                      <span>Sign Out</span>
+                    </button>
+                  </div>
+                )}
+              </>
             ) : (
-              <div className="w-7 h-7 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold text-slate-200">
-                {currentUser.name.charAt(0)}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={!authReady || authLoading}
+                  onClick={() => void signInWithGoogle()}
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold transition-colors disabled:opacity-50"
+                  title="Sign in with Google to save your workspace to Cloud Firestore"
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">
+                    {authLoading ? 'Signing in...' : 'Sign In'}
+                  </span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('settings')}
+                  className="hidden xl:flex items-center gap-1.5 text-xs text-slate-300 hover:text-white"
+                  title="User Settings"
+                >
+                  {currentUser.avatarUrl ? (
+                    <img
+                      src={currentUser.avatarUrl}
+                      alt={currentUser.name}
+                      className="w-7 h-7 rounded-full object-cover ring-1 ring-slate-700"
+                    />
+                  ) : (
+                    <div className="w-7 h-7 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold text-slate-200">
+                      {currentUser.name.charAt(0)}
+                    </div>
+                  )}
+                </button>
               </div>
             )}
-            <span className="hidden xl:inline text-xs font-medium text-slate-200 truncate max-w-[100px]">
-              {currentUser.name}
-            </span>
+
+            {authError && (
+              <div className="absolute right-0 top-full mt-2 w-72 bg-red-950/95 border border-red-800 rounded-lg p-2.5 text-[11px] text-red-200 shadow-xl z-50 flex items-start justify-between gap-2">
+                <span className="leading-snug">{authError}</span>
+                <button
+                  type="button"
+                  onClick={clearAuthError}
+                  className="text-red-300 hover:text-white shrink-0"
+                  aria-label="Dismiss auth error"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
           </div>
         </div>
       </div>

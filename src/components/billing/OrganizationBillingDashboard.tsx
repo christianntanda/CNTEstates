@@ -18,6 +18,7 @@ import {
   Printer,
   ChevronRight,
   Download,
+  FileDown,
   Lock,
   Clock,
   Sparkles,
@@ -33,6 +34,8 @@ import {
 import { formatBillingCadenceLabel } from '../../services/billingPeriodService';
 import { SubscriptionInvoice } from '../../types';
 import { ManageBillingModal } from './ManageBillingModal';
+import { BrandedInvoiceExportModal } from '../invoices/BrandedInvoiceExportModal';
+import { downloadInvoicePdf } from '../../services/invoicePdfGenerator';
 
 interface OrganizationBillingDashboardProps {
   onUpgradeClick?: (targetPlanId?: string) => void;
@@ -60,6 +63,8 @@ export const OrganizationBillingDashboard: React.FC<OrganizationBillingDashboard
 
   const [isManageModalOpen, setIsManageModalOpen] = useState(false);
   const [isCancelConfirmOpen, setIsCancelConfirmOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  const [exportTargetInvoice, setExportTargetInvoice] = useState<SubscriptionInvoice | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
@@ -522,6 +527,17 @@ export const OrganizationBillingDashboard: React.FC<OrganizationBillingDashboard
 
               <div className="flex items-center gap-2">
                 <button
+                  onClick={() => {
+                    setExportTargetInvoice(currentInvoice);
+                    setIsExportModalOpen(true);
+                  }}
+                  className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+                  title="Download invoice in organization branded PDF format"
+                >
+                  <FileDown className="w-3.5 h-3.5" />
+                  <span>Download Branded PDF</span>
+                </button>
+                <button
                   onClick={() => handlePrint(currentInvoice)}
                   className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
                 >
@@ -591,13 +607,25 @@ export const OrganizationBillingDashboard: React.FC<OrganizationBillingDashboard
                         </span>
                       </td>
                       <td className="py-2 px-3 text-right">
-                        <button
-                          onClick={() => handlePrint(inv)}
-                          className="text-slate-400 hover:text-slate-100 p-1 rounded hover:bg-slate-800 transition-colors cursor-pointer"
-                          title="Print or view receipt"
-                        >
-                          <Printer className="w-3.5 h-3.5" />
-                        </button>
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            onClick={() => {
+                              setExportTargetInvoice(inv);
+                              setIsExportModalOpen(true);
+                            }}
+                            className="text-slate-400 hover:text-emerald-400 p-1 rounded hover:bg-slate-800 transition-colors cursor-pointer"
+                            title="Download branded PDF invoice"
+                          >
+                            <FileDown className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handlePrint(inv)}
+                            className="text-slate-400 hover:text-slate-100 p-1 rounded hover:bg-slate-800 transition-colors cursor-pointer"
+                            title="Print or view receipt"
+                          >
+                            <Printer className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   ))}
@@ -757,6 +785,14 @@ export const OrganizationBillingDashboard: React.FC<OrganizationBillingDashboard
         onSuccess={(msg) => {
           setStatusMessage({ type: 'success', text: msg });
         }}
+      />
+
+      {/* Branded PDF Invoice Generator Modal */}
+      <BrandedInvoiceExportModal
+        isOpen={isExportModalOpen}
+        onClose={() => setIsExportModalOpen(false)}
+        initialInvoice={exportTargetInvoice || currentInvoice}
+        allInvoices={invoices}
       />
     </div>
   );

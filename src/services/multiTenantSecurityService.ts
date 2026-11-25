@@ -34,7 +34,9 @@ export type ProtectedResourceType =
   | 'payment'
   | 'billing_history'
   | 'usage'
-  | 'subscription_history';
+  | 'subscription_history'
+  | 'organization'
+  | 'audit_log';
 
 export type EnforcementLevel =
   | 'database'

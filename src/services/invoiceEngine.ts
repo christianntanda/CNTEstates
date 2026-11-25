@@ -299,9 +299,33 @@ export function normalizeInvoiceRecord(raw: Partial<SubscriptionInvoice> & Recor
 }
 
 /**
- * In-Memory Authoritative Invoices Repository
+ * In-Memory Authoritative Invoices Repository & Payment Idempotency Registry
  */
 let invoicesRepository: SubscriptionInvoice[] = [];
+const processedPaymentReferences = new Set<string>();
+
+/**
+ * Validates strict account ownership before displaying, downloading, or paying an invoice.
+ */
+export function validateInvoiceOwnership(params: {
+  invoice: SubscriptionInvoice | undefined | null;
+  requestingOrganizationId: string;
+  isPlatformAdmin?: boolean;
+}): { authorized: boolean; reason?: string } {
+  if (!params.invoice) {
+    return { authorized: false, reason: 'Invoice record not found.' };
+  }
+  if (params.isPlatformAdmin) {
+    return { authorized: true };
+  }
+  if (!params.requestingOrganizationId || params.invoice.organization_id !== params.requestingOrganizationId) {
+    return {
+      authorized: false,
+      reason: `Account Isolation Violation: Invoice '${params.invoice.invoice_number}' does not belong to organization '${params.requestingOrganizationId}'.`,
+    };
+  }
+  return { authorized: true };
+}
 
 /**
  * Initializes and seeds the in-memory invoices store with authoritative records
@@ -858,12 +882,32 @@ export function recordInvoicePayment(params: {
   transactionReference?: string;
 }): {
   success: boolean;
+  duplicate?: boolean;
   invoice?: SubscriptionInvoice;
   error?: string;
 } {
   const invoice = getInvoiceById(params.invoiceId);
   if (!invoice) {
     return { success: false, error: `Invoice '${params.invoiceId}' not found.` };
+  }
+
+  // Duplicate payment protection #1: Reject payment attempts against already-paid invoices
+  if (invoice.invoice_status === 'paid' || invoice.payment_status === 'paid') {
+    return {
+      success: false,
+      duplicate: true,
+      error: `Duplicate payment prevented: Invoice ${invoice.invoice_number} has already been settled and is permanently locked.`,
+    };
+  }
+
+  // Duplicate payment protection #2: Deduplicate repeated transaction references / idempotency keys
+  const normalizedRef = params.transactionReference?.trim();
+  if (normalizedRef && processedPaymentReferences.has(normalizedRef)) {
+    return {
+      success: false,
+      duplicate: true,
+      error: `Duplicate payment prevented: Transaction reference '${normalizedRef}' has already been processed.`,
+    };
   }
 
   if (isInvoiceImmutable(invoice)) {
@@ -898,6 +942,10 @@ export function recordInvoicePayment(params: {
   } else {
     newInvoiceStatus = 'partially_paid';
     newPaymentStatus = 'partially_paid';
+  }
+
+  if (normalizedRef) {
+    processedPaymentReferences.add(normalizedRef);
   }
 
   const updatedInvoice: SubscriptionInvoice = {

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useApp } from '../../context/AppContext';
+import { useFirebase } from '../../context/FirebaseContext';
 import {
   getCentralizedPlanPresentations,
   CentralizedPlanPresentation,
@@ -37,14 +38,19 @@ import {
 
 interface PublicPricingPageProps {
   embedded?: boolean;
+  onSelectPlanForAuth?: (planId: string) => void;
 }
 
-export const PublicPricingPage: React.FC<PublicPricingPageProps> = ({ embedded = false }) => {
+export const PublicPricingPage: React.FC<PublicPricingPageProps> = ({
+  embedded = false,
+  onSelectPlanForAuth,
+}) => {
   const {
     organization,
     activeSubscription,
     setActiveTab,
   } = useApp();
+  const { firebaseUser } = useFirebase();
 
   const [billingPeriod, setBillingPeriod] = useState<BillingPeriod>('monthly');
   const [selectedCountryName, setSelectedCountryName] = useState<string>('South Africa');
@@ -57,14 +63,14 @@ export const PublicPricingPage: React.FC<PublicPricingPageProps> = ({ embedded =
   const countryConfig = getCountryConfiguration(selectedCountryName);
   const targetCurrency = countryConfig.default_currency;
 
-  const currentOrgPlanId = organization?.planId || activeSubscription?.plan_id || 'business';
-  const isLoggedIn = !!organization?.id;
+  const currentOrgPlanId = organization?.planId || activeSubscription?.plan_id || 'free';
+  const isLoggedIn = Boolean(firebaseUser && firebaseUser.emailVerified);
 
   // Retrieve all 6 plans dynamically from the centralized plan catalog
   const planPresentations = getCentralizedPlanPresentations(
     billingPeriod,
     targetCurrency,
-    currentOrgPlanId,
+    isLoggedIn ? currentOrgPlanId : '',
     isLoggedIn
   );
 
@@ -77,9 +83,10 @@ export const PublicPricingPage: React.FC<PublicPricingPageProps> = ({ embedded =
     if (isLoggedIn) {
       setSelectedPlanForUpgrade(presentation.id);
       setIsUpgradeModalOpen(true);
+    } else if (onSelectPlanForAuth) {
+      onSelectPlanForAuth(presentation.id);
     } else {
-      // Direct guest to platform onboarding / dashboard
-      setActiveTab('dashboard');
+      setActiveTab('auth_signup');
     }
   };
 
@@ -149,36 +156,54 @@ export const PublicPricingPage: React.FC<PublicPricingPageProps> = ({ embedded =
             </div>
 
             <div className="flex items-center gap-3">
-              <button
-                onClick={() => setActiveTab('dashboard')}
-                className="px-3.5 py-1.5 text-xs text-slate-300 hover:text-white transition-colors cursor-pointer"
-              >
-                {isLoggedIn ? 'Go to Workspace' : 'Sign In'}
-              </button>
-              <button
-                onClick={() => setActiveTab('subscription')}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors cursor-pointer"
-              >
-                Manage Billing
-              </button>
+              {isLoggedIn ? (
+                <>
+                  <button
+                    onClick={() => setActiveTab('dashboard')}
+                    className="px-3.5 py-1.5 text-xs text-slate-300 hover:text-white transition-colors cursor-pointer"
+                  >
+                    Go to Workspace
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('subscription')}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors cursor-pointer"
+                  >
+                    Manage Billing
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setActiveTab('auth_signin')}
+                    className="px-3.5 py-1.5 text-xs text-slate-300 hover:text-white transition-colors cursor-pointer"
+                  >
+                    Sign In
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('auth_signup')}
+                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors cursor-pointer"
+                  >
+                    Sign Up / Register
+                  </button>
+                </>
+              )}
             </div>
           </div>
         </header>
       )}
 
       {/* Main Pricing Hero Header */}
-      <section id="plans" className="pt-12 pb-10 px-6 max-w-7xl mx-auto w-full text-center space-y-6">
-        <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-900 border border-emerald-800/80 text-emerald-400 text-xs font-semibold">
-          <Sparkles className="w-3.5 h-3.5" />
-          <span>SEQUENCE 23 — AUTHORITATIVE PUBLIC PRICING PAGE</span>
-        </div>
+      <section id="plans" className="pt-16 pb-10 px-6 max-w-7xl mx-auto w-full text-center space-y-5">
+        <p className="text-xs font-semibold text-emerald-400">
+          Transparent Multi-Currency Subscription Plans
+        </p>
 
         <div className="space-y-3 max-w-3xl mx-auto">
-          <h1 className="text-3xl sm:text-4xl md:text-5xl font-extrabold text-white tracking-tight leading-tight">
+          <h2 className="text-[32px] font-extrabold text-white tracking-tight leading-tight [text-wrap:balance]">
             Transparent, Predictable Plans For Every Real Estate Portfolio
-          </h1>
+          </h2>
           <p className="text-sm sm:text-base text-slate-400 leading-relaxed">
-            All six CNTEstates subscription plans are dynamically rendered from our centralized plan catalog with zero hardcoded pricing. Scale seamlessly from a 2-unit duplex to a 5,000-unit institutional portfolio.
+            All six CNTEstates subscription tiers are dynamically calculated in your selected local currency. Scale seamlessly from a 2-unit duplex to a 5,000-unit institutional portfolio.
           </p>
         </div>
 

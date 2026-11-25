@@ -32,6 +32,7 @@ import {
   Bot,
   ShieldCheck,
   ArrowRight,
+  FileDown,
 } from 'lucide-react';
 import {
   SubscriptionInvoice,
@@ -39,6 +40,13 @@ import {
   CustomBillingSchedule,
   BillingPeriodDefinition,
 } from '../../types';
+import {
+  BrandedInvoiceExportModal,
+} from '../invoices/BrandedInvoiceExportModal';
+import {
+  downloadInvoicePdf,
+} from '../../services/invoicePdfGenerator';
+import { validateInvoiceOwnership } from '../../services/invoiceEngine';
 import {
   calculatePlanPriceForPeriod,
   calculatePeriodDates,
@@ -127,6 +135,8 @@ export const SubscriptionBillingView: React.FC = () => {
   const registeredPeriods = getAllBillingPeriods();
   const [selectedPlanId, setSelectedPlanId] = useState(organization.planId);
   const [upgradeModalPlanId, setUpgradeModalPlanId] = useState<string | null>(null);
+  const [isBrandedExportModalOpen, setIsBrandedExportModalOpen] = useState(false);
+  const [selectedInvoiceForExport, setSelectedInvoiceForExport] = useState<SubscriptionInvoice | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [feedbackMessage, setFeedbackMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -154,6 +164,19 @@ export const SubscriptionBillingView: React.FC = () => {
   };
 
   const handlePrintInvoice = (inv: SubscriptionInvoice) => {
+    const ownership = validateInvoiceOwnership({
+      invoice: inv,
+      requestingOrganizationId: organization.id,
+      isPlatformAdmin: userRole === 'platform_admin',
+    });
+    if (!ownership.authorized) {
+      setFeedbackMessage({
+        type: 'error',
+        text: ownership.reason || 'Invoice ownership check failed.',
+      });
+      return;
+    }
+
     openPrint({
       type: 'invoice',
       title: `CNTEstates SaaS Subscription Invoice - ${inv.invoice_number}`,
@@ -209,27 +232,53 @@ export const SubscriptionBillingView: React.FC = () => {
     });
   };
 
-  const invoices = organization.subscriptionInvoices && organization.subscriptionInvoices.length > 0
-    ? organization.subscriptionInvoices
-    : [
-        {
-          id: 'sinv-default-1',
-          invoice_number: 'CNTE-INV-2026-09',
-          organization_id: organization.id,
-          organization_name: organization.name,
-          plan_id: organization.planId,
-          plan_name: currentPlan.plan_name,
-          billing_date: '2026-09-15',
-          billing_period: 'monthly' as const,
-          master_price_usd: currentPlan.master_price,
-          billing_currency: billingCurrency,
-          billed_amount: currentConversion.convertedPrice,
-          exchange_rate: currentConversion.exchangeRate,
-          exchange_rate_source: currentConversion.exchangeRateSource,
-          payment_method: 'Mastercard •••• 4022',
-          status: 'paid' as const,
-        },
-      ];
+  // Strict account ownership filtering: only display/export invoices owned by the authenticated organization
+  const ownedOrganizationInvoices = (organization.subscriptionInvoices || []).filter((inv) =>
+    validateInvoiceOwnership({
+      invoice: inv,
+      requestingOrganizationId: organization.id,
+      isPlatformAdmin: userRole === 'platform_admin',
+    }).authorized
+  );
+
+  const invoices: SubscriptionInvoice[] =
+    ownedOrganizationInvoices.length > 0
+      ? ownedOrganizationInvoices
+      : [
+          {
+            invoice_id: 'sinv-default-1',
+            id: 'sinv-default-1',
+            organization_id: organization.id,
+            organization_name: organization.name,
+            subscription_id: activeSubscription.subscription_id || 'sub-org-active',
+            invoice_number: 'CNTE-INV-2026-09',
+            invoice_date: '2026-09-15',
+            billing_date: '2026-09-15',
+            billing_period: 'monthly' as const,
+            due_date: '2026-09-15',
+            currency: billingCurrency,
+            billing_currency: billingCurrency,
+            plan_id: organization.planId,
+            plan_name: currentPlan.plan_name,
+            master_price_usd: currentPlan.master_price,
+            subtotal: Math.round((currentConversion.convertedPrice || 4445) * 0.85),
+            tax: Math.round((currentConversion.convertedPrice || 4445) * 0.15),
+            discount: 0,
+            total: currentConversion.convertedPrice || 4445,
+            amount_paid: currentConversion.convertedPrice || 4445,
+            amount_due: 0,
+            payment_status: 'paid',
+            invoice_status: 'paid',
+            payment_method: 'Mastercard •••• 4022',
+            external_invoice_id: 'in_stripe_default_01',
+            created_at: '2026-09-15T08:00:00Z',
+            updated_at: '2026-09-15T08:00:00Z',
+            billed_amount: currentConversion.convertedPrice,
+            exchange_rate: currentConversion.exchangeRate,
+            exchange_rate_source: currentConversion.exchangeRateSource,
+            status: 'paid',
+          },
+        ];
 
   // SEQUENCE 28: RBAC Visibility Gate for Subscription Billing View
   if (!canViewBilling(userRole)) {
@@ -277,13 +326,100 @@ export const SubscriptionBillingView: React.FC = () => {
                 <option value="property_manager">Property Manager (Read-Only)</option>
                 <option value="auditor">Compliance Auditor (Read-Only)</option>
                 <option value="platform_admin">Platform Admin (Superuser)</option>
+                <option value="tenant">Resident Tenant</option>
               </select>
             </div>
           </div>
         </div>
 
+        {/* TENANT BRANDED PDF INVOICE GENERATOR PORTAL */}
+        <div className="bg-slate-900 border border-emerald-500/40 rounded-2xl p-6 space-y-4 shadow-md">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-3 border-b border-slate-800">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 bg-emerald-950 border border-emerald-800 text-emerald-400 rounded-xl">
+                <FileDown className="w-5 h-5" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-bold text-white">
+                    Tenant Branded Invoice & Statement Generator
+                  </h3>
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 border border-emerald-800 text-emerald-400 font-bold uppercase">
+                    Tenant Export Ready
+                  </span>
+                </div>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Tenants can export and download official tax invoices and rent statements in {organization.name}'s branded PDF format.
+                </p>
+              </div>
+            </div>
+
+            <button
+              onClick={() => {
+                setSelectedInvoiceForExport(invoices[0] || null);
+                setIsBrandedExportModalOpen(true);
+              }}
+              className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer self-start sm:self-auto"
+            >
+              <FileDown className="w-4 h-4" />
+              <span>Export Branded PDF</span>
+            </button>
+          </div>
+
+          <div className="overflow-x-auto border border-slate-800 rounded-xl">
+            <table className="w-full text-left text-xs border-collapse">
+              <thead>
+                <tr className="bg-slate-950 text-slate-400 font-semibold border-b border-slate-800 text-[10px] uppercase">
+                  <th className="py-2.5 px-3">Invoice Number</th>
+                  <th className="py-2.5 px-3">Date</th>
+                  <th className="py-2.5 px-3">Cadence</th>
+                  <th className="py-2.5 px-3">Amount</th>
+                  <th className="py-2.5 px-3">Status</th>
+                  <th className="py-2.5 px-3 text-right">Download Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60 font-mono text-[11px]">
+                {invoices.map((inv) => (
+                  <tr key={inv.id || inv.invoice_id} className="hover:bg-slate-950/40">
+                    <td className="py-2.5 px-3 text-white font-bold">{inv.invoice_number}</td>
+                    <td className="py-2.5 px-3 text-slate-300">{inv.invoice_date || inv.billing_date}</td>
+                    <td className="py-2.5 px-3 text-slate-400 font-sans capitalize">{inv.billing_period}</td>
+                    <td className="py-2.5 px-3 text-emerald-400 font-bold">
+                      {formatSubscriptionPrice(inv.total || inv.billed_amount || 0, inv.currency || billingCurrency)}
+                    </td>
+                    <td className="py-2.5 px-3">
+                      <span className="px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800 text-[10px] font-bold uppercase">
+                        {(inv.payment_status || 'PAID').toUpperCase()}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-sans">
+                      <button
+                        onClick={() => {
+                          setSelectedInvoiceForExport(inv);
+                          setIsBrandedExportModalOpen(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+                      >
+                        <FileDown className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Download PDF</span>
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
         {/* SEQUENCE 28 RBAC Console */}
         <BillingRbacConsole />
+
+        <BrandedInvoiceExportModal
+          isOpen={isBrandedExportModalOpen}
+          onClose={() => setIsBrandedExportModalOpen(false)}
+          initialInvoice={selectedInvoiceForExport || invoices[0]}
+          allInvoices={invoices}
+        />
       </div>
     );
   }
@@ -331,13 +467,28 @@ export const SubscriptionBillingView: React.FC = () => {
           </p>
         </div>
 
-        {/* Active Cadence Indicator */}
-        <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 p-1.5 rounded-xl self-start sm:self-auto text-xs">
-          <span className="text-[11px] text-slate-400 font-mono px-2">Cadence:</span>
-          <span className="bg-emerald-950 text-emerald-300 border border-emerald-800 px-2.5 py-1 rounded-lg font-semibold text-xs capitalize flex items-center gap-1.5">
-            <Calendar className="w-3.5 h-3.5 text-emerald-400" />
-            <span>{formatBillingCadenceLabel(selectedBillingPeriod, selectedBillingPeriod === 'custom' ? customSchedule : undefined)}</span>
-          </span>
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          {/* Branded PDF Invoice Generator Action Button */}
+          <button
+            onClick={() => {
+              setSelectedInvoiceForExport(invoices[0] || null);
+              setIsBrandedExportModalOpen(true);
+            }}
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+            title="Download and export organization invoices in branded PDF format"
+          >
+            <FileDown className="w-4 h-4" />
+            <span>Download Branded PDF</span>
+          </button>
+
+          {/* Active Cadence Indicator */}
+          <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 p-1.5 rounded-xl text-xs">
+            <span className="text-[11px] text-slate-400 font-mono px-2">Cadence:</span>
+            <span className="bg-emerald-950 text-emerald-300 border border-emerald-800 px-2.5 py-1 rounded-lg font-semibold text-xs capitalize flex items-center gap-1.5">
+              <Calendar className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{formatBillingCadenceLabel(selectedBillingPeriod, selectedBillingPeriod === 'custom' ? customSchedule : undefined)}</span>
+            </span>
+          </div>
         </div>
       </div>
 
@@ -1257,6 +1408,14 @@ export const SubscriptionBillingView: React.FC = () => {
         initialTargetPlanId={upgradeModalPlanId || 'business'}
         onClose={() => setUpgradeModalPlanId(null)}
         onSuccess={() => setUpgradeModalPlanId(null)}
+      />
+
+      {/* Authoritative Branded PDF Invoice Generator Modal */}
+      <BrandedInvoiceExportModal
+        isOpen={isBrandedExportModalOpen}
+        onClose={() => setIsBrandedExportModalOpen(false)}
+        initialInvoice={selectedInvoiceForExport || invoices[0]}
+        allInvoices={invoices}
       />
     </div>
   );

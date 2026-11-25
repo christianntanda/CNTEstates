@@ -1,0 +1,668 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // GLOBAL DEFAULT DENY (Zero-Trust Fallback)
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // GLOBAL PRIMITIVES & IDENTITY HELPERS
+    // =========================================================================
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'christian.ntanda@gmail.com'
+      );
+    }
+
+    function isValidId(value) {
+      return value is string &&
+        value.size() >= 1 &&
+        value.size() <= 128 &&
+        value.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidCurrency(value) {
+      return value is string &&
+        value.size() >= 3 &&
+        value.size() <= 10 &&
+        value.matches('^[A-Z]{3}$');
+    }
+
+    function isValidEmail(value) {
+      return value is string &&
+        value.size() >= 3 &&
+        value.size() <= 254 &&
+        value.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$');
+    }
+
+    function isOptionalString(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isOptionalNumber(data, field, minVal, maxVal) {
+      return !(field in data) || (data[field] is number && data[field] >= minVal && data[field] <= maxVal);
+    }
+
+    function isValidRoleCategory(role) {
+      return role in [
+        'org_owner', 'portfolio_manager', 'property_manager', 'building_manager',
+        'finance_manager', 'maintenance_manager', 'technician', 'contractor',
+        'security_officer', 'facility_manager', 'tenant', 'auditor'
+      ];
+    }
+
+    function isOptionalProviderList(data, field) {
+      return !(field in data) || (
+        data[field] is list &&
+        data[field].size() <= 10 &&
+        (data[field].size() == 0 || (data[field][0] is string && data[field][0].size() >= 1 && data[field][0].size() <= 40))
+      );
+    }
+
+    function isOrgOwner(orgId) {
+      return isVerifiedUser() &&
+        exists(/databases/$(database)/documents/organizations/$(orgId)) &&
+        get(/databases/$(database)/documents/organizations/$(orgId)).data.ownerId == request.auth.uid;
+    }
+
+    function isOrgMember(orgId) {
+      return isVerifiedUser() &&
+        exists(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    function orgMemberRole(orgId) {
+      return get(/databases/$(database)/documents/organizations/$(orgId)/members/$(request.auth.uid)).data.role;
+    }
+
+    function hasOrgBillingReadAccess(orgId) {
+      return isOrgOwner(orgId) || isAdmin() || (
+        isOrgMember(orgId) &&
+        orgMemberRole(orgId) in ['org_owner', 'portfolio_manager', 'property_manager', 'finance_manager', 'auditor']
+      );
+    }
+
+    function canManageOrgOperations(orgId) {
+      return isOrgOwner(orgId) || isAdmin() || (
+        isOrgMember(orgId) &&
+        orgMemberRole(orgId) in ['org_owner', 'portfolio_manager', 'property_manager', 'building_manager', 'maintenance_manager', 'facility_manager']
+      );
+    }
+
+    function canWorkOnOrgTickets(orgId) {
+      return canManageOrgOperations(orgId) || (
+        isOrgMember(orgId) &&
+        orgMemberRole(orgId) in ['contractor', 'technician']
+      );
+    }
+
+    // =========================================================================
+    // STANDALONE ENTITY VALIDATORS (Synchronized with firebase-blueprint.json)
+    // =========================================================================
+    function isValidUserProfile(d) {
+      return d.keys().hasAll([
+          'uid', 'displayName', 'email', 'defaultOrganizationId',
+          'preferredCurrency', 'preferredLanguage', 'createdAt', 'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'uid', 'displayName', 'email', 'photoURL', 'defaultOrganizationId',
+          'preferredCurrency', 'preferredLanguage', 'accountCategory',
+          'linkedProviders', 'termsAcceptedAt', 'privacyAcceptedAt',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(d.uid) &&
+        d.displayName is string && d.displayName.size() >= 1 && d.displayName.size() <= 120 &&
+        isValidEmail(d.email) &&
+        isOptionalString(d, 'photoURL', 512) &&
+        isValidId(d.defaultOrganizationId) &&
+        isValidCurrency(d.preferredCurrency) &&
+        d.preferredLanguage in ['en', 'fr', 'es', 'pt'] &&
+        (!('accountCategory' in d) || isValidRoleCategory(d.accountCategory)) &&
+        isOptionalProviderList(d, 'linkedProviders') &&
+        isOptionalString(d, 'termsAcceptedAt', 40) &&
+        isOptionalString(d, 'privacyAcceptedAt', 40) &&
+        d.createdAt is timestamp &&
+        d.updatedAt is timestamp;
+    }
+
+    function isValidOrganization(d) {
+      return d.keys().hasAll([
+          'id', 'ownerId', 'name', 'planId', 'subscriptionStatus',
+          'operatingCountry', 'baseCurrency', 'billingCurrency',
+          'monthlySpend', 'renewalDate', 'createdAt', 'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'id', 'ownerId', 'name', 'planId', 'subscriptionStatus',
+          'operatingCountry', 'baseCurrency', 'billingCurrency',
+          'monthlySpend', 'renewalDate', 'companyAddress', 'companyEmail',
+          'companyPhone', 'taxRegistrationNumber', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(d.id) &&
+        isValidId(d.ownerId) &&
+        d.name is string && d.name.size() >= 1 && d.name.size() <= 160 &&
+        d.planId in ['free', 'starter', 'basic', 'professional', 'business', 'enterprise'] &&
+        d.subscriptionStatus in [
+          'free', 'trial', 'active', 'past_due', 'payment_failed',
+          'suspended', 'cancelled', 'expired', 'pending_activation'
+        ] &&
+        d.operatingCountry is string && d.operatingCountry.size() >= 2 && d.operatingCountry.size() <= 80 &&
+        isValidCurrency(d.baseCurrency) &&
+        isValidCurrency(d.billingCurrency) &&
+        d.monthlySpend is number && d.monthlySpend >= 0 && d.monthlySpend <= 10000000 &&
+        d.renewalDate is string && d.renewalDate.size() <= 32 &&
+        isOptionalString(d, 'companyAddress', 300) &&
+        isOptionalString(d, 'companyEmail', 254) &&
+        isOptionalString(d, 'companyPhone', 40) &&
+        isOptionalString(d, 'taxRegistrationNumber', 64) &&
+        d.createdAt is timestamp &&
+        d.updatedAt is timestamp;
+    }
+
+    function isValidOrganizationMember(d) {
+      return d.keys().hasAll([
+          'uid', 'organizationId', 'role', 'displayName', 'createdAt', 'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'uid', 'organizationId', 'role', 'displayName', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(d.uid) &&
+        isValidId(d.organizationId) &&
+        isValidRoleCategory(d.role) &&
+        d.displayName is string && d.displayName.size() >= 1 && d.displayName.size() <= 120 &&
+        d.createdAt is timestamp &&
+        d.updatedAt is timestamp;
+    }
+
+    function isValidProperty(d) {
+      return d.keys().hasAll([
+          'id', 'organizationId', 'ownerId', 'name', 'type', 'address',
+          'city', 'country', 'totalBuildings', 'totalUnits', 'occupiedUnits',
+          'status', 'createdAt', 'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'id', 'organizationId', 'ownerId', 'name', 'type', 'address',
+          'city', 'region', 'country', 'postalCode', 'ownerName', 'managerName',
+          'description', 'imageUrl', 'yearBuilt', 'totalBuildings', 'totalUnits',
+          'occupiedUnits', 'parkingSpaces', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(d.id) &&
+        isValidId(d.organizationId) &&
+        isValidId(d.ownerId) &&
+        d.name is string && d.name.size() >= 1 && d.name.size() <= 160 &&
+        d.type in [
+          'residential', 'commercial', 'mixed_use', 'retail',
+          'industrial', 'student_accommodation', 'other'
+        ] &&
+        d.address is string && d.address.size() >= 1 && d.address.size() <= 240 &&
+        d.city is string && d.city.size() >= 1 && d.city.size() <= 100 &&
+        isOptionalString(d, 'region', 100) &&
+        d.country is string && d.country.size() >= 1 && d.country.size() <= 100 &&
+        isOptionalString(d, 'postalCode', 32) &&
+        isOptionalString(d, 'ownerName', 120) &&
+        isOptionalString(d, 'managerName', 120) &&
+        isOptionalString(d, 'description', 1000) &&
+        isOptionalString(d, 'imageUrl', 512) &&
+        isOptionalNumber(d, 'yearBuilt', 1800, 2200) &&
+        d.totalBuildings is number && d.totalBuildings >= 0 && d.totalBuildings <= 10000 &&
+        d.totalUnits is number && d.totalUnits >= 0 && d.totalUnits <= 100000 &&
+        d.occupiedUnits is number && d.occupiedUnits >= 0 && d.occupiedUnits <= d.totalUnits &&
+        isOptionalNumber(d, 'parkingSpaces', 0, 100000) &&
+        d.status in ['active', 'under_renovation', 'development'] &&
+        d.createdAt is timestamp &&
+        d.updatedAt is timestamp;
+    }
+
+    function isValidUnit(d) {
+      return d.keys().hasAll([
+          'id', 'organizationId', 'ownerId', 'propertyId', 'unitNumber',
+          'floor', 'type', 'squareMeters', 'monthlyRent', 'currency',
+          'status', 'createdAt', 'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'id', 'organizationId', 'ownerId', 'propertyId', 'buildingId',
+          'unitNumber', 'floor', 'type', 'squareMeters', 'monthlyRent',
+          'currency', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(d.id) &&
+        isValidId(d.organizationId) &&
+        isValidId(d.ownerId) &&
+        isValidId(d.propertyId) &&
+        (!('buildingId' in d) || isValidId(d.buildingId)) &&
+        d.unitNumber is string && d.unitNumber.size() >= 1 && d.unitNumber.size() <= 40 &&
+        d.floor is number && d.floor >= -20 && d.floor <= 300 &&
+        d.type in [
+          'apartment', 'penthouse', 'office_suite', 'retail_shop',
+          'warehouse', 'studio', 'parking_bay', 'storage'
+        ] &&
+        d.squareMeters is number && d.squareMeters >= 0 && d.squareMeters <= 1000000 &&
+        d.monthlyRent is number && d.monthlyRent >= 0 && d.monthlyRent <= 100000000 &&
+        isValidCurrency(d.currency) &&
+        d.status in ['occupied', 'vacant', 'maintenance', 'reserved'] &&
+        d.createdAt is timestamp &&
+        d.updatedAt is timestamp;
+    }
+
+    function isValidServiceTicket(d) {
+      return d.keys().hasAll([
+          'id', 'organizationId', 'ownerId', 'code', 'propertyId',
+          'title', 'category', 'priority', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'id', 'organizationId', 'ownerId', 'code', 'propertyId',
+          'propertyName', 'unitNumber', 'title', 'description',
+          'category', 'priority', 'status', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(d.id) &&
+        isValidId(d.organizationId) &&
+        isValidId(d.ownerId) &&
+        d.code is string && d.code.size() >= 1 && d.code.size() <= 40 &&
+        isValidId(d.propertyId) &&
+        isOptionalString(d, 'propertyName', 160) &&
+        isOptionalString(d, 'unitNumber', 40) &&
+        d.title is string && d.title.size() >= 1 && d.title.size() <= 160 &&
+        isOptionalString(d, 'description', 2000) &&
+        d.category in [
+          'electrical', 'plumbing', 'hvac', 'generator', 'elevator',
+          'fire_systems', 'cctv_security', 'structural', 'appliances',
+          'cleaning', 'pest_control'
+        ] &&
+        d.priority in ['emergency', 'critical', 'high', 'normal', 'low'] &&
+        d.status in [
+          'new', 'assigned', 'in_progress', 'awaiting_contractor',
+          'awaiting_parts', 'completed', 'verified', 'closed'
+        ] &&
+        d.createdAt is timestamp &&
+        d.updatedAt is timestamp;
+    }
+
+    function isValidSubscriptionInvoice(d) {
+      return d.keys().hasAll([
+          'id', 'organizationId', 'ownerId', 'invoiceNumber', 'planId',
+          'planName', 'billingPeriod', 'currency', 'subtotal', 'tax',
+          'discount', 'total', 'amountPaid', 'amountDue', 'paymentStatus',
+          'invoiceStatus', 'paymentMethod', 'invoiceDate', 'dueDate',
+          'createdAt', 'updatedAt'
+        ]) &&
+        d.keys().hasOnly([
+          'id', 'organizationId', 'ownerId', 'invoiceNumber', 'planId',
+          'planName', 'billingPeriod', 'currency', 'subtotal', 'tax',
+          'discount', 'total', 'amountPaid', 'amountDue', 'paymentStatus',
+          'invoiceStatus', 'paymentMethod', 'invoiceDate', 'dueDate',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(d.id) &&
+        isValidId(d.organizationId) &&
+        isValidId(d.ownerId) &&
+        d.invoiceNumber is string && d.invoiceNumber.size() >= 1 && d.invoiceNumber.size() <= 64 &&
+        d.planId is string && d.planId.size() >= 1 && d.planId.size() <= 64 &&
+        d.planName is string && d.planName.size() >= 1 && d.planName.size() <= 120 &&
+        d.billingPeriod in ['monthly', 'quarterly', 'annual', 'custom'] &&
+        isValidCurrency(d.currency) &&
+        d.subtotal is number && d.subtotal >= 0 && d.subtotal <= 100000000 &&
+        d.tax is number && d.tax >= 0 && d.tax <= 100000000 &&
+        d.discount is number && d.discount >= 0 && d.discount <= 100000000 &&
+        d.total is number && d.total >= 0 && d.total <= 100000000 &&
+        d.amountPaid is number && d.amountPaid >= 0 && d.amountPaid <= 100000000 &&
+        d.amountDue is number && d.amountDue >= 0 && d.amountDue <= 100000000 &&
+        d.paymentStatus in ['unpaid', 'paid', 'partially_paid', 'failed', 'refunded', 'waived'] &&
+        d.invoiceStatus in ['draft', 'open', 'paid', 'partially_paid', 'past_due', 'void', 'uncollectible', 'cancelled'] &&
+        d.paymentMethod is string && d.paymentMethod.size() <= 120 &&
+        d.invoiceDate is string && d.invoiceDate.size() <= 32 &&
+        d.dueDate is string && d.dueDate.size() <= 32 &&
+        d.createdAt is timestamp &&
+        d.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(d) {
+      return d.keys().hasAll([
+          'id', 'organizationId', 'ownerId', 'actorUid', 'actorName',
+          'actorRole', 'action', 'entityType', 'entityId', 'details', 'createdAt'
+        ]) &&
+        d.keys().hasOnly([
+          'id', 'organizationId', 'ownerId', 'actorUid', 'actorName',
+          'actorRole', 'action', 'entityType', 'entityId', 'details', 'createdAt'
+        ]) &&
+        isValidId(d.id) &&
+        isValidId(d.organizationId) &&
+        isValidId(d.ownerId) &&
+        isValidId(d.actorUid) &&
+        d.actorName is string && d.actorName.size() >= 1 && d.actorName.size() <= 120 &&
+        d.actorRole is string && d.actorRole.size() >= 1 && d.actorRole.size() <= 64 &&
+        d.action is string && d.action.size() >= 1 && d.action.size() <= 100 &&
+        d.entityType is string && d.entityType.size() >= 1 && d.entityType.size() <= 80 &&
+        d.entityId is string && d.entityId.size() >= 1 && d.entityId.size() <= 128 &&
+        d.details is string && d.details.size() <= 1000 &&
+        d.createdAt is timestamp;
+    }
+
+    // =========================================================================
+    // 1. PRIVATE USER PROFILES (/users/{userId}) — Strict PII & RBAC Isolation
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+
+      allow create: if isOwner(userId) &&
+        isValidId(userId) &&
+        isValidUserProfile(incoming()) &&
+        incoming().uid == userId &&
+        incoming().email == request.auth.token.email &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isValidUserProfile(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action: Owner updates non-RBAC profile preferences & linkedProviders
+          (isOwner(userId) &&
+            incoming().email == existing().email &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'photoURL', 'defaultOrganizationId',
+              'preferredCurrency', 'preferredLanguage', 'linkedProviders', 'updatedAt'
+            ])
+          ) ||
+          // Action: Platform admin role / account management override
+          (isAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'displayName', 'photoURL', 'defaultOrganizationId',
+              'preferredCurrency', 'preferredLanguage', 'accountCategory',
+              'linkedProviders', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 2. PLATFORM ADMIN REGISTRY (/admins/{userId}) — Out-of-Band Only
+    // =========================================================================
+    match /admins/{userId} {
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // =========================================================================
+    // 3. TENANT ORGANIZATIONS (/organizations/{orgId})
+    // =========================================================================
+    match /organizations/{orgId} {
+      allow get: if isVerifiedUser() && (
+        existing().ownerId == request.auth.uid || isOrgMember(orgId) || isAdmin()
+      );
+      allow list: if isVerifiedUser() && (resource.data.ownerId == request.auth.uid || isAdmin());
+
+      allow create: if isVerifiedUser() &&
+        isValidId(orgId) &&
+        isValidOrganization(incoming()) &&
+        incoming().id == orgId &&
+        incoming().ownerId == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidOrganization(incoming()) &&
+        (existing().ownerId == request.auth.uid || isAdmin()) &&
+        incoming().id == existing().id &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'planId', 'subscriptionStatus', 'operatingCountry',
+          'baseCurrency', 'billingCurrency', 'monthlySpend', 'renewalDate',
+          'companyAddress', 'companyEmail', 'companyPhone',
+          'taxRegistrationNumber', 'updatedAt'
+        ]);
+
+      allow delete: if isAdmin();
+
+      // -----------------------------------------------------------------------
+      // 4. ORGANIZATION MEMBERS (/organizations/{orgId}/members/{memberId})
+      // -----------------------------------------------------------------------
+      match /members/{memberId} {
+        allow get: if isVerifiedUser() && (
+          isOrgOwner(orgId) || existing().uid == request.auth.uid || isAdmin()
+        );
+        allow list: if isVerifiedUser() && (
+          resource.data.uid == request.auth.uid || isAdmin()
+        );
+
+        allow create: if isVerifiedUser() &&
+          isValidId(orgId) &&
+          isValidId(memberId) &&
+          isValidOrganizationMember(incoming()) &&
+          (isOrgOwner(orgId) || isAdmin()) &&
+          incoming().uid == memberId &&
+          incoming().organizationId == orgId &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+
+        allow update: if isVerifiedUser() &&
+          isValidOrganizationMember(incoming()) &&
+          (isOrgOwner(orgId) || isAdmin()) &&
+          incoming().uid == existing().uid &&
+          incoming().organizationId == existing().organizationId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'role', 'displayName', 'updatedAt'
+          ]);
+
+        allow delete: if isVerifiedUser() && (isOrgOwner(orgId) || isAdmin());
+      }
+
+      // -----------------------------------------------------------------------
+      // 5. PROPERTIES (/organizations/{orgId}/properties/{propertyId})
+      // -----------------------------------------------------------------------
+      match /properties/{propertyId} {
+        allow get: if isVerifiedUser() && (
+          isOrgOwner(orgId) || isOrgMember(orgId) || existing().ownerId == request.auth.uid || isAdmin()
+        );
+        allow list: if isVerifiedUser() && (
+          resource.data.ownerId == request.auth.uid || isAdmin()
+        );
+
+        allow create: if isVerifiedUser() &&
+          isValidId(orgId) &&
+          isValidId(propertyId) &&
+          isValidProperty(incoming()) &&
+          canManageOrgOperations(orgId) &&
+          incoming().id == propertyId &&
+          incoming().organizationId == orgId &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+
+        allow update: if isVerifiedUser() &&
+          isValidProperty(incoming()) &&
+          canManageOrgOperations(orgId) &&
+          incoming().id == existing().id &&
+          incoming().organizationId == existing().organizationId &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'name', 'type', 'address', 'city', 'region', 'country',
+            'postalCode', 'ownerName', 'managerName', 'description',
+            'imageUrl', 'yearBuilt', 'totalBuildings', 'totalUnits',
+            'occupiedUnits', 'parkingSpaces', 'status', 'updatedAt'
+          ]);
+
+        allow delete: if isVerifiedUser() && (isOrgOwner(orgId) || isAdmin());
+      }
+
+      // -----------------------------------------------------------------------
+      // 6. UNITS (/organizations/{orgId}/units/{unitId})
+      // -----------------------------------------------------------------------
+      match /units/{unitId} {
+        allow get: if isVerifiedUser() && (
+          isOrgOwner(orgId) || isOrgMember(orgId) || existing().ownerId == request.auth.uid || isAdmin()
+        );
+        allow list: if isVerifiedUser() && (
+          resource.data.ownerId == request.auth.uid || isAdmin()
+        );
+
+        allow create: if isVerifiedUser() &&
+          isValidId(orgId) &&
+          isValidId(unitId) &&
+          isValidUnit(incoming()) &&
+          canManageOrgOperations(orgId) &&
+          incoming().id == unitId &&
+          incoming().organizationId == orgId &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+
+        allow update: if isVerifiedUser() &&
+          isValidUnit(incoming()) &&
+          canManageOrgOperations(orgId) &&
+          incoming().id == existing().id &&
+          incoming().organizationId == existing().organizationId &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().propertyId == existing().propertyId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'buildingId', 'unitNumber', 'floor', 'type',
+            'squareMeters', 'monthlyRent', 'currency', 'status', 'updatedAt'
+          ]);
+
+        allow delete: if isVerifiedUser() && (isOrgOwner(orgId) || isAdmin());
+      }
+
+      // -----------------------------------------------------------------------
+      // 7. SERVICE TICKETS (/organizations/{orgId}/tickets/{ticketId})
+      //    Terminal State Lock: closed tickets cannot be modified by non-admins
+      // -----------------------------------------------------------------------
+      match /tickets/{ticketId} {
+        allow get: if isVerifiedUser() && (
+          isOrgOwner(orgId) || isOrgMember(orgId) || existing().ownerId == request.auth.uid || isAdmin()
+        );
+        allow list: if isVerifiedUser() && (
+          resource.data.ownerId == request.auth.uid || isAdmin()
+        );
+
+        allow create: if isVerifiedUser() &&
+          isValidId(orgId) &&
+          isValidId(ticketId) &&
+          isValidServiceTicket(incoming()) &&
+          (isOrgOwner(orgId) || isOrgMember(orgId) || isAdmin()) &&
+          incoming().id == ticketId &&
+          incoming().organizationId == orgId &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().status in ['new', 'assigned', 'in_progress'] &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+
+        allow update: if isVerifiedUser() &&
+          isValidServiceTicket(incoming()) &&
+          canWorkOnOrgTickets(orgId) &&
+          (existing().status != 'closed' || isAdmin()) &&
+          incoming().id == existing().id &&
+          incoming().organizationId == existing().organizationId &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().code == existing().code &&
+          incoming().propertyId == existing().propertyId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'propertyName', 'unitNumber', 'title', 'description',
+            'category', 'priority', 'status', 'updatedAt'
+          ]);
+
+        allow delete: if isVerifiedUser() && (
+          (isOrgOwner(orgId) && existing().status != 'closed') || isAdmin()
+        );
+      }
+
+      // -----------------------------------------------------------------------
+      // 8. SUBSCRIPTION INVOICES (/organizations/{orgId}/invoices/{invoiceId})
+      //    Strict Billing RBAC + Immutable Terminal Locking
+      // -----------------------------------------------------------------------
+      match /invoices/{invoiceId} {
+        allow get: if isVerifiedUser() && hasOrgBillingReadAccess(orgId);
+        allow list: if isVerifiedUser() && (
+          (resource.data.ownerId == request.auth.uid && hasOrgBillingReadAccess(orgId)) || isAdmin()
+        );
+
+        allow create: if isVerifiedUser() &&
+          isValidId(orgId) &&
+          isValidId(invoiceId) &&
+          isValidSubscriptionInvoice(incoming()) &&
+          (isOrgOwner(orgId) || isAdmin()) &&
+          incoming().id == invoiceId &&
+          incoming().organizationId == orgId &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time;
+
+        allow update: if isVerifiedUser() &&
+          isValidSubscriptionInvoice(incoming()) &&
+          (isOrgOwner(orgId) || isAdmin()) &&
+          (!(existing().invoiceStatus in ['paid', 'void', 'cancelled']) || isAdmin()) &&
+          incoming().id == existing().id &&
+          incoming().organizationId == existing().organizationId &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().invoiceNumber == existing().invoiceNumber &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'amountPaid', 'amountDue', 'paymentStatus', 'invoiceStatus',
+            'paymentMethod', 'dueDate', 'updatedAt'
+          ]);
+
+        allow delete: if isAdmin();
+      }
+
+      // -----------------------------------------------------------------------
+      // 9. AUDIT LOGS (/organizations/{orgId}/auditLogs/{logId})
+      //    Strictly Append-Only Immutable Trail (Denied to tenant/contractor/tech)
+      // -----------------------------------------------------------------------
+      match /auditLogs/{logId} {
+        allow get: if isVerifiedUser() && hasOrgBillingReadAccess(orgId);
+        allow list: if isVerifiedUser() && (
+          (resource.data.ownerId == request.auth.uid && hasOrgBillingReadAccess(orgId)) || isAdmin()
+        );
+
+        allow create: if isVerifiedUser() &&
+          isValidId(orgId) &&
+          isValidId(logId) &&
+          isValidAuditLog(incoming()) &&
+          (isOrgOwner(orgId) || isOrgMember(orgId) || isAdmin()) &&
+          incoming().id == logId &&
+          incoming().organizationId == orgId &&
+          incoming().ownerId == request.auth.uid &&
+          incoming().actorUid == request.auth.uid &&
+          incoming().createdAt == request.time;
+
+        allow update, delete: if false;
+      }
+    }
+  }
+}

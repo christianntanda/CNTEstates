@@ -1,5 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
+import { FirebaseProvider, useFirebase } from './context/FirebaseContext';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { Header } from './components/Header';
 import { Sidebar } from './components/Sidebar';
 import { DashboardView } from './components/views/DashboardView';
@@ -29,6 +31,8 @@ import { TechnicianView } from './components/portals/TechnicianView';
 import { PlatformAdminView } from './components/portals/PlatformAdminView';
 import { LandingPage } from './components/landing/LandingPage';
 import { PublicPricingPage } from './components/pricing/PublicPricingPage';
+import { PublicLegalPage } from './components/legal/PublicLegalPage';
+import { AuthView } from './components/auth/AuthView';
 import { MultiTenantSecurityConsole } from './components/security/MultiTenantSecurityConsole';
 import { BillingRbacConsole } from './components/security/BillingRbacConsole';
 import { DatabaseMigrationConsole } from './components/database/DatabaseMigrationConsole';
@@ -38,7 +42,22 @@ import { FinalProductionValidationConsole } from './components/testing/FinalProd
 import { FinalArchitectureConsole } from './components/architecture/FinalArchitectureConsole';
 import { UniversalPrintModal } from './components/printing/UniversalPrintModal';
 import { FeatureGate } from './components/entitlements/FeatureGate';
-import { Menu, X, ArrowLeft } from 'lucide-react';
+import { AccountSecurityPanel } from './components/security/AccountSecurityPanel';
+import {
+  getRoleNavigationPolicy,
+  isTabAuthorizedForRole,
+} from './services/rbacNavigationPolicy';
+import {
+  resolvePathToRoute,
+  getPathForTab,
+  isPublicTab,
+} from './utils/appRoutes';
+import { Menu, X, ShieldAlert } from 'lucide-react';
+import type { UserRole } from './types';
+
+function getDefaultWorkspaceTabForRole(role: UserRole, isPlatformAdmin: boolean): string {
+  return getRoleNavigationPolicy(role, isPlatformAdmin).defaultTab;
+}
 
 const AppContent: React.FC = () => {
   const {
@@ -48,19 +67,226 @@ const AppContent: React.FC = () => {
     currentPrintPayload,
     closePrint,
   } = useApp();
+
+  const {
+    firebaseUser,
+    authReady,
+    userRoleCategory,
+    isPlatformAdmin,
+  } = useFirebase();
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [selectedAuthPlanId, setSelectedAuthPlanId] = useState<string | undefined>(undefined);
+  const [intendedProtectedTab, setIntendedProtectedTab] = useState<string | null>(null);
+  const [landingSection, setLandingSection] = useState<'features' | 'solutions' | 'faq' | 'contact' | undefined>(undefined);
+  const [initialRouteApplied, setInitialRouteApplied] = useState(false);
 
-  // If user requested public marketing landing page, render it standalone
+  const isAuthenticated = Boolean(firebaseUser && firebaseUser.emailVerified);
+
+  const resolveAuthorizedPostAuthTarget = (requestedTab: string | null): string => {
+    const defaultTab = getDefaultWorkspaceTabForRole(userRoleCategory, isPlatformAdmin);
+    if (!requestedTab || isPublicTab(requestedTab)) {
+      return defaultTab;
+    }
+    return isTabAuthorizedForRole(requestedTab, userRoleCategory, isPlatformAdmin)
+      ? requestedTab
+      : defaultTab;
+  };
+
+  // 1. Hydrate active view from initial browser pathname and subscribe to browser Back/Forward (popstate)
+  useEffect(() => {
+    const syncFromLocation = () => {
+      const resolved = resolvePathToRoute(window.location.pathname);
+      setLandingSection(resolved.landingSection);
+      if (!resolved.isPublic) {
+        setIntendedProtectedTab(resolved.tab);
+      }
+      setActiveTab(resolved.tab);
+      setInitialRouteApplied(true);
+    };
+
+    syncFromLocation();
+    window.addEventListener('popstate', syncFromLocation);
+    return () => window.removeEventListener('popstate', syncFromLocation);
+  }, [setActiveTab]);
+
+  // 2. Keep browser URL bar cleanly synchronized with activeTab & auth state
+  useEffect(() => {
+    if (!initialRouteApplied) return;
+    if (!isAuthenticated && !isPublicTab(activeTab)) {
+      if (intendedProtectedTab !== activeTab) {
+        setIntendedProtectedTab(activeTab);
+      }
+      if (window.location.pathname !== '/signin') {
+        window.history.replaceState({ tab: 'auth_signin' }, '', '/signin');
+      }
+      return;
+    }
+
+    const desiredPath = getPathForTab(activeTab, window.location.pathname);
+    if (window.location.pathname !== desiredPath) {
+      window.history.pushState({ tab: activeTab }, '', desiredPath);
+    }
+  }, [activeTab, isAuthenticated, initialRouteApplied, intendedProtectedTab]);
+
+  // 3. When authenticated user is on an auth screen, redirect to their originally requested page ONLY if authorized for their role
+  useEffect(() => {
+    if (
+      isAuthenticated &&
+      (activeTab === 'auth_signin' || activeTab === 'auth_signup' || activeTab === 'auth_reset')
+    ) {
+      const target = resolveAuthorizedPostAuthTarget(intendedProtectedTab);
+      setIntendedProtectedTab(null);
+      setActiveTab(target);
+    }
+  }, [isAuthenticated, activeTab, intendedProtectedTab, userRoleCategory, isPlatformAdmin, setActiveTab]);
+
+  const handleOpenAuth = (mode: 'signin' | 'signup' | 'reset', planId?: string) => {
+    setSelectedAuthPlanId(planId);
+    setActiveTab(
+      mode === 'signup' ? 'auth_signup' : mode === 'reset' ? 'auth_reset' : 'auth_signin'
+    );
+  };
+
+  const handleEnterWorkspace = () => {
+    if (isAuthenticated) {
+      setActiveTab(getDefaultWorkspaceTabForRole(userRoleCategory, isPlatformAdmin));
+    } else {
+      handleOpenAuth('signin');
+    }
+  };
+
+  // =========================================================================
+  // PUBLIC ROUTES — Always accessible without requiring authentication
+  // =========================================================================
   if (activeTab === 'marketingPage') {
-    return <LandingPage />;
+    return (
+      <LandingPage
+        initialSection={landingSection}
+        onOpenAuth={handleOpenAuth}
+        onEnterWorkspace={handleEnterWorkspace}
+      />
+    );
   }
 
-  // If user requested public pricing page, render it standalone
   if (activeTab === 'pricing' || activeTab === 'publicPricing') {
-    return <PublicPricingPage />;
+    return (
+      <PublicPricingPage
+        onSelectPlanForAuth={(planId) => handleOpenAuth('signup', planId)}
+      />
+    );
   }
+
+  if (activeTab === 'terms' || activeTab === 'privacy') {
+    return (
+      <PublicLegalPage
+        documentType={activeTab === 'privacy' ? 'privacy' : 'terms'}
+        onBackToHome={() => {
+          setLandingSection(undefined);
+          setActiveTab('marketingPage');
+        }}
+        onSwitchDocument={(doc) => setActiveTab(doc)}
+        onOpenPricing={() => setActiveTab('pricing')}
+        onOpenAuth={(mode) => handleOpenAuth(mode)}
+        onEnterWorkspace={handleEnterWorkspace}
+      />
+    );
+  }
+
+  if (activeTab === 'auth_signin' || activeTab === 'auth_signup' || activeTab === 'auth_reset') {
+    const initialMode =
+      activeTab === 'auth_signup' ? 'signup' : activeTab === 'auth_reset' ? 'reset' : 'signin';
+    return (
+      <AuthView
+        initialMode={initialMode}
+        selectedPlanId={selectedAuthPlanId}
+        onModeChange={(nextMode) =>
+          setActiveTab(
+            nextMode === 'signup' ? 'auth_signup' : nextMode === 'reset' ? 'auth_reset' : 'auth_signin'
+          )
+        }
+        onBackToHome={() => {
+          setLandingSection(undefined);
+          setActiveTab('marketingPage');
+        }}
+        onOpenLegal={(doc) => setActiveTab(doc)}
+        onAuthenticated={() => {
+          const target = resolveAuthorizedPostAuthTarget(intendedProtectedTab);
+          setIntendedProtectedTab(null);
+          setActiveTab(target);
+        }}
+      />
+    );
+  }
+
+  // =========================================================================
+  // PROTECTED APPLICATION ROUTES — Require verified Firebase authentication
+  // =========================================================================
+  if (!authReady) {
+    return (
+      <div className="min-h-screen bg-slate-950 text-slate-200 flex items-center justify-center">
+        <div className="text-center space-y-3">
+          <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin mx-auto" />
+          <p className="text-xs text-slate-400">Verifying session...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return (
+      <AuthView
+        initialMode="signin"
+        selectedPlanId={selectedAuthPlanId}
+        redirectNotice="Sign in or register an account to access protected CNTEstates workspace views."
+        onModeChange={(nextMode) =>
+          setActiveTab(
+            nextMode === 'signup' ? 'auth_signup' : nextMode === 'reset' ? 'auth_reset' : 'auth_signin'
+          )
+        }
+        onBackToHome={() => {
+          setIntendedProtectedTab(null);
+          setLandingSection(undefined);
+          setActiveTab('marketingPage');
+        }}
+        onOpenLegal={(doc) => setActiveTab(doc)}
+        onAuthenticated={() => {
+          const target = resolveAuthorizedPostAuthTarget(intendedProtectedTab || activeTab);
+          setIntendedProtectedTab(null);
+          setActiveTab(target);
+        }}
+      />
+    );
+  }
+
+  const navPolicy = getRoleNavigationPolicy(userRoleCategory, isPlatformAdmin);
 
   const renderActiveView = () => {
+    // STRICT ROUTE-LEVEL RBAC GUARD: Prevent direct navigation or state manipulation
+    // from bypassing role authorization boundaries.
+    if (!isTabAuthorizedForRole(activeTab, userRoleCategory, isPlatformAdmin)) {
+      return (
+        <div className="p-8 max-w-2xl mx-auto">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-3">
+            <div className="flex items-center gap-2 text-amber-400">
+              <ShieldAlert className="w-5 h-5" />
+              <h2 className="text-base font-bold text-white">Access Restricted by Role Policy</h2>
+            </div>
+            <p className="text-sm text-slate-400 leading-relaxed">
+              Your verified role (<span className="text-slate-200 font-medium capitalize">{isPlatformAdmin ? 'SaaS Platform Admin' : userRoleCategory.replace(/_/g, ' ')}</span>) is not authorized to access this section. CNTEstates enforces least-privilege access control and strict account isolation across all modules.
+            </p>
+            <button
+              type="button"
+              onClick={() => setActiveTab(navPolicy.defaultTab)}
+              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold"
+            >
+              Return to Authorized Workspace
+            </button>
+          </div>
+        </div>
+      );
+    }
+
     switch (activeTab) {
       case 'dashboard':
         return <DashboardView />;
@@ -127,13 +353,28 @@ const AppContent: React.FC = () => {
         return <SubscriptionBillingView />;
       case 'settings':
         return <SettingsView />;
+      case 'accountSecurity':
+        if (!navPolicy.canAccessOrgSettings) {
+          return (
+            <div className="p-6 max-w-5xl mx-auto">
+              <AccountSecurityPanel />
+            </div>
+          );
+        }
+        return <SettingsView initialTab="account_security" />;
       case 'tenantPortal':
+        if (userRoleCategory === 'tenant' || isPlatformAdmin) {
+          return <TenantPortalView />;
+        }
         return (
           <FeatureGate feature="tenant_portal" onUpgrade={() => setActiveTab('subscription')}>
             <TenantPortalView />
           </FeatureGate>
         );
       case 'contractorPortal':
+        if (userRoleCategory === 'contractor' || isPlatformAdmin) {
+          return <ContractorPortalView />;
+        }
         return (
           <FeatureGate feature="contractor_portal" onUpgrade={() => setActiveTab('subscription')}>
             <ContractorPortalView />
@@ -145,9 +386,6 @@ const AppContent: React.FC = () => {
       case 'adminBilling':
       case 'billingAdmin':
         return <PlatformAdminView />;
-      case 'pricing':
-      case 'publicPricing':
-        return <PublicPricingPage />;
       case 'tenantSecurity':
       case 'multiTenantSecurity':
         return <MultiTenantSecurityConsole />;
@@ -231,8 +469,12 @@ const AppContent: React.FC = () => {
 
 export default function App() {
   return (
-    <AppProvider>
-      <AppContent />
-    </AppProvider>
+    <ErrorBoundary>
+      <FirebaseProvider>
+        <AppProvider>
+          <AppContent />
+        </AppProvider>
+      </FirebaseProvider>
+    </ErrorBoundary>
   );
 }

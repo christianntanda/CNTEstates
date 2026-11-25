@@ -14,15 +14,20 @@
     "test:regression": "tsx src/scripts/runRegressionTests.ts",
     "test:production": "tsx src/scripts/runProductionValidation.ts",
     "test:architecture": "tsx src/scripts/runArchitectureValidation.ts",
-    "test": "npm run test:billing && npm run test:regression && npm run test:production && npm run test:architecture",
-    "test:all": "npm run test:billing && npm run test:regression && npm run test:production && npm run test:architecture"
+    "test:security": "tsx src/scripts/runSecurityAndIsolationTests.ts",
+    "test": "npm run test:billing && npm run test:regression && npm run test:production && npm run test:architecture && npm run test:security",
+    "test:all": "npm run test:billing && npm run test:regression && npm run test:production && npm run test:architecture && npm run test:security"
   },
   "dependencies": {
+    "@firebase/eslint-plugin-security-rules": "^0.0.2",
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.3.3",
     "@vitejs/plugin-react": "^6.1.1",
     "dotenv": "^17.2.3",
+    "eslint": "^10.15.0",
     "express": "^4.21.2",
+    "firebase": "^13.4.0",
+    "firebase-admin": "^14.5.1",
     "jspdf": "^4.2.1",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",

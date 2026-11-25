@@ -39,6 +39,8 @@ import {
   ALLOWED_STATUS_TRANSITIONS,
 } from '../../services/invoiceEngine';
 import { formatSubscriptionPrice } from '../../services/currencyService';
+import { downloadInvoicePdf } from '../../services/invoicePdfGenerator';
+import { BrandedInvoiceExportModal } from './BrandedInvoiceExportModal';
 
 /**
  * Generates an authoritative, print-ready, stand-alone HTML/PDF invoice
@@ -409,6 +411,7 @@ export const InvoiceEngineConsole: React.FC = () => {
     refreshInvoices,
     openPrint,
     currentUser,
+    userRole,
     addAuditLog,
   } = useApp();
 
@@ -436,6 +439,8 @@ export const InvoiceEngineConsole: React.FC = () => {
   const [newStatus, setNewStatus] = useState<InvoiceStatus>('open');
   const [newNotes, setNewNotes] = useState('');
   const [isCreating, setIsCreating] = useState(false);
+  const [isBrandedExportModalOpen, setIsBrandedExportModalOpen] = useState(false);
+  const [brandedExportTarget, setBrandedExportTarget] = useState<SubscriptionInvoice | null>(null);
 
   const [actionFeedback, setActionFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -557,23 +562,16 @@ export const InvoiceEngineConsole: React.FC = () => {
       'CNTEstatesDocumentEngine',
       inv.invoice_number,
       undefined,
-      `Exported authoritative PDF tax invoice ${inv.invoice_number} for ${organization.name}`
+      `Exported authoritative branded PDF tax invoice ${inv.invoice_number} for ${organization.name}`
     );
 
-    // 2. Generate and download standalone compliant tax invoice HTML document
-    const htmlContent = generateInvoiceDocumentEngineHtml(inv, organization);
-    const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `CNTEstates-Invoice-${inv.invoice_number}.html`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-
-    // 3. Open universal print engine so user can also use browser native Save to PDF
-    handlePrint(inv);
+    // 2. Real vector branded PDF invoice download
+    downloadInvoicePdf(inv, organization, {
+      exportedByRole: userRole,
+      exportedByName: userRole === 'tenant' ? 'Tenant Account' : 'Authorized Administrator',
+      includeAuditSeal: true,
+      includeTaxBreakdown: true,
+    });
   };
 
   const handleExportAllCSV = () => {
@@ -761,8 +759,19 @@ export const InvoiceEngineConsole: React.FC = () => {
             <span>Export CSV</span>
           </button>
           <button
+            onClick={() => {
+              setBrandedExportTarget(filteredInvoices[0] || null);
+              setIsBrandedExportModalOpen(true);
+            }}
+            className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-semibold transition-colors cursor-pointer shadow-xs"
+            title="Export and customize branded PDF invoices"
+          >
+            <FileDown className="w-3.5 h-3.5" />
+            <span>Export Branded PDF</span>
+          </button>
+          <button
             onClick={() => setIsCreateModalOpen(true)}
-            className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer"
+            className="flex items-center gap-1.5 px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-sm cursor-pointer"
           >
             <Plus className="w-4 h-4" />
             <span>Issue Invoice</span>
@@ -1785,6 +1794,14 @@ export const InvoiceEngineConsole: React.FC = () => {
           </form>
         </div>
       )}
+
+      {/* Authoritative Branded PDF Invoice Generator Modal */}
+      <BrandedInvoiceExportModal
+        isOpen={isBrandedExportModalOpen}
+        onClose={() => setIsBrandedExportModalOpen(false)}
+        initialInvoice={brandedExportTarget || filteredInvoices[0]}
+        allInvoices={filteredInvoices}
+      />
     </div>
   );
 };

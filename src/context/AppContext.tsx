@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useMemo, useCallback } from 'react';
+import { authenticatedFetch } from '../utils/authFetch';
 import {
   Language,
   Currency,
@@ -175,6 +176,7 @@ import {
   convertSubscriptionPrice,
   formatSubscriptionPrice,
 } from '../services/currencyService';
+import { useFirebase } from './FirebaseContext';
 
 interface AppContextType {
   language: Language;
@@ -423,7 +425,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [organization.id]);
 
   const [exchangeRateUnavailable, setExchangeRateUnavailable] = useState<boolean>(false);
-  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [activeTab, setActiveTab] = useState<string>('marketingPage');
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [selectedPropertyId, setSelectedPropertyId] = useState<string>('all');
 
@@ -543,8 +545,112 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     ]);
   }, []);
 
-  // Current active user matching role
-  const currentUser: UserProfile = demoUsers.find((u) => u.role === userRole) || demoUsers[0];
+  const {
+    firebaseUser,
+    cloudHydrated,
+    cloudSnapshot,
+    userRoleCategory,
+    userPreferredLanguage,
+    syncOrganizationToCloud,
+    syncPropertyToCloud,
+    syncUnitToCloud,
+    syncTicketToCloud,
+    updateTicketStatusInCloud,
+    syncInvoiceToCloud,
+    appendAuditLogToCloud,
+  } = useFirebase();
+
+  // Strictly synchronize authenticated user's RBAC role category & preferred language
+  useEffect(() => {
+    if (firebaseUser && firebaseUser.emailVerified) {
+      setUserRole(userRoleCategory);
+      setLanguageState(userPreferredLanguage);
+    }
+  }, [firebaseUser, userRoleCategory, userPreferredLanguage]);
+
+  // STRICT ACCOUNT ISOLATION: Replace workspace state exclusively with the authenticated
+  // user's Firestore tenant snapshot (never merge global mock data or another user's localStorage)
+  useEffect(() => {
+    if (!firebaseUser) {
+      setOrganization(initialOrganizations[0]);
+      setProperties([]);
+      setUnits([]);
+      setTickets([]);
+      setAuditLogs([]);
+      setInvoices([]);
+      setBuildings([]);
+      setTenants([]);
+      setLeases([]);
+      setWorkOrders([]);
+      setFinancialRecords([]);
+      return;
+    }
+    if (!firebaseUser.emailVerified) {
+      return;
+    }
+    if (!cloudHydrated || !cloudSnapshot) {
+      return;
+    }
+
+    if (cloudSnapshot.organization) {
+      const cloudOrg = cloudSnapshot.organization;
+      setOrganization((prev) => ({
+        ...prev,
+        ...cloudOrg,
+        id: cloudSnapshot.organizationId,
+        name: cloudOrg.name || prev.name,
+        planId: cloudOrg.planId || 'free',
+        subscriptionStatus: cloudOrg.subscriptionStatus || 'free',
+        operatingCountry: cloudOrg.operatingCountry || 'South Africa',
+        country: cloudOrg.country || cloudOrg.operatingCountry || 'South Africa',
+        baseCurrency: cloudOrg.baseCurrency || 'ZAR',
+        billingCurrency: cloudOrg.billingCurrency || cloudOrg.baseCurrency || 'ZAR',
+        currency: cloudOrg.currency || cloudOrg.baseCurrency || 'ZAR',
+        branding: {
+          companyName: cloudOrg.branding?.companyName || cloudOrg.name || '',
+          companyAddress: cloudOrg.branding?.companyAddress || '',
+          companyEmail: cloudOrg.branding?.companyEmail || firebaseUser.email || '',
+          companyPhone: cloudOrg.branding?.companyPhone || '',
+          companyWebsite: cloudOrg.branding?.companyWebsite || '',
+          taxRegistrationNumber: cloudOrg.branding?.taxRegistrationNumber || '',
+          businessRegistrationNumber: cloudOrg.branding?.businessRegistrationNumber || '',
+        },
+      }));
+      if (cloudOrg.baseCurrency) {
+        setOrganizationBaseCurrency(cloudOrg.baseCurrency);
+      }
+    }
+
+    // Strict per-tenant replacement for cloud-backed collections
+    setProperties(cloudSnapshot.properties);
+    setUnits(cloudSnapshot.units);
+    setTickets(cloudSnapshot.tickets);
+    setAuditLogs(cloudSnapshot.auditLogs);
+    setInvoices(
+      cloudSnapshot.invoices.map((inv) => normalizeInvoiceRecord(inv as Partial<SubscriptionInvoice>))
+    );
+
+    // Clear un-scoped demo collections when cloud tenant has no cross-tenant records
+    setBuildings([]);
+    setTenants([]);
+    setLeases([]);
+    setWorkOrders([]);
+    setFinancialRecords([]);
+  }, [firebaseUser, cloudHydrated, cloudSnapshot]);
+
+  // Current active user matching role (reflects signed-in Firebase account when authenticated)
+  const baseDemoUser: UserProfile = demoUsers.find((u) => u.role === userRole) || demoUsers[0];
+  const currentUser: UserProfile = firebaseUser
+    ? {
+        ...baseDemoUser,
+        id: firebaseUser.uid,
+        name: firebaseUser.displayName || firebaseUser.email?.split('@')[0] || baseDemoUser.name,
+        email: firebaseUser.email || baseDemoUser.email,
+        role: userRole,
+        organizationId: organization.id,
+        avatarUrl: firebaseUser.photoURL || baseDemoUser.avatarUrl,
+      }
+    : baseDemoUser;
 
   const activeSubscription: CustomerSubscription = organization.subscriptionRecord
     ? normalizeSubscriptionRecord(organization.subscriptionRecord)
@@ -633,7 +739,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // Mirror to server endpoint asynchronously
     try {
-      fetch('/api/billing/audit-logs', {
+      authenticatedFetch('/api/billing/audit-logs', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -714,7 +820,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
       // Sync with server route
       try {
-        fetch(`/api/admin/billing/organizations/${params.organizationId}/capture-payment`, {
+        authenticatedFetch(`/api/admin/billing/organizations/${params.organizationId}/capture-payment`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -760,7 +866,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     });
 
     try {
-      fetch('/api/admin/billing/actions/log', {
+      authenticatedFetch('/api/admin/billing/actions/log', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -785,7 +891,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const askAiBillingAssistant = useCallback(
     async (prompt: string, actionPayload?: any) => {
       try {
-        const res = await fetch('/api/ai/billing/query', {
+        const res = await authenticatedFetch('/api/ai/billing/query', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -851,7 +957,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
 
         try {
-          fetch(`/api/ai/billing/authorization-requests/${requestId}/authorize`, {
+          authenticatedFetch(`/api/ai/billing/authorization-requests/${requestId}/authorize`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -908,7 +1014,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         });
 
         try {
-          fetch(`/api/ai/billing/authorization-requests/${requestId}/reject`, {
+          authenticatedFetch(`/api/ai/billing/authorization-requests/${requestId}/reject`, {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -1285,6 +1391,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     saveInvoice(newInvoice);
     setInvoices((prev) => [newInvoice, ...prev]);
+    if (firebaseUser) {
+      void syncInvoiceToCloud(newInvoice).catch(() => {});
+    }
 
     setOrganization((prev) => {
       const updatedOrg: Organization = {
@@ -1298,6 +1407,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         subscriptionInvoices: [newInvoice, ...(prev.subscriptionInvoices || [])],
       };
       localStorage.setItem('cnt_organization', JSON.stringify(updatedOrg));
+      if (firebaseUser) {
+        void syncOrganizationToCloud(updatedOrg).catch(() => {});
+      }
       return updatedOrg;
     });
 
@@ -1486,7 +1598,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // Asynchronously notify backend server to synchronize state
     try {
-      fetch('/api/subscription/upgrade', {
+      authenticatedFetch('/api/subscription/upgrade', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1615,7 +1727,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     );
 
     try {
-      fetch(`/api/invoices/${updated.invoice_id}/pay`, {
+      authenticatedFetch(`/api/invoices/${updated.invoice_id}/pay`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1709,7 +1821,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     try {
-      fetch(`/api/invoices/${updated.invoice_id}/status`, {
+      authenticatedFetch(`/api/invoices/${updated.invoice_id}/status`, {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
@@ -1753,7 +1865,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     );
 
     try {
-      fetch('/api/invoices', {
+      authenticatedFetch('/api/invoices', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1904,7 +2016,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // Sync via server endpoint
     try {
-      fetch(`/api/subscription/lifecycle/${event}`, {
+      authenticatedFetch(`/api/subscription/lifecycle/${event}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2002,7 +2114,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // Sync to backend server
     try {
-      fetch('/api/subscriptions/history', {
+      authenticatedFetch('/api/subscriptions/history', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2021,13 +2133,19 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updateOrganizationBranding = (branding: Partial<OrganizationBranding>) => {
-    setOrganization((prev) => ({
-      ...prev,
-      branding: {
-        ...(prev.branding || ({} as OrganizationBranding)),
-        ...branding,
-      },
-    }));
+    setOrganization((prev) => {
+      const updated: Organization = {
+        ...prev,
+        branding: {
+          ...(prev.branding || ({} as OrganizationBranding)),
+          ...branding,
+        },
+      };
+      if (firebaseUser) {
+        void syncOrganizationToCloud(updated).catch(() => {});
+      }
+      return updated;
+    });
     addAuditLog(
       'ORGANIZATION_BRANDING_UPDATED',
       'OrganizationBranding',
@@ -2062,26 +2180,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setCurrentPrintPayload(null);
   };
 
-  // Sync to localStorage
+  // Sync guest-only preview state to localStorage; authenticated accounts persist strictly
+  // in their isolated Firestore tenant to prevent cross-account contamination on shared browsers.
   useEffect(() => {
+    if (firebaseUser) return;
     localStorage.setItem('cnt_tickets', JSON.stringify(tickets));
-  }, [tickets]);
+  }, [tickets, firebaseUser]);
 
   useEffect(() => {
+    if (firebaseUser) return;
     localStorage.setItem('cnt_work_orders', JSON.stringify(workOrders));
-  }, [workOrders]);
+  }, [workOrders, firebaseUser]);
 
   useEffect(() => {
+    if (firebaseUser) return;
     localStorage.setItem('cnt_tenants', JSON.stringify(tenants));
-  }, [tenants]);
+  }, [tenants, firebaseUser]);
 
   useEffect(() => {
+    if (firebaseUser) return;
     localStorage.setItem('cnt_leases', JSON.stringify(leases));
-  }, [leases]);
+  }, [leases, firebaseUser]);
 
   useEffect(() => {
+    if (firebaseUser) return;
     localStorage.setItem('cnt_financials', JSON.stringify(financialRecords));
-  }, [financialRecords]);
+  }, [financialRecords, firebaseUser]);
 
   const addAuditLog = (
     action: string,
@@ -2103,6 +2227,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ipAddress: '127.0.0.1',
     };
     setAuditLogs((prev) => [newEntry, ...prev]);
+    if (firebaseUser) {
+      void appendAuditLogToCloud(newEntry).catch(() => {});
+    }
   };
 
   const [currentSimulation, setCurrentSimulation] = useState<
@@ -2232,7 +2359,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // 2. Authoritative Backend Capacity Enforcement
     try {
-      const response = await fetch('/api/properties', {
+      const response = await authenticatedFetch('/api/properties', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2267,6 +2394,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     setProperties((prev) => [...prev, property]);
+    if (firebaseUser) {
+      void syncPropertyToCloud(property, true).catch(() => {});
+    }
     addAuditLog('PROPERTY_CREATED', 'Property', id, undefined, `Created ${property.name}`);
 
     // Check if capacity is approaching 80%+
@@ -2328,7 +2458,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // 2. Authoritative Backend Capacity Enforcement
     try {
-      const response = await fetch('/api/units', {
+      const response = await authenticatedFetch('/api/units', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2363,6 +2493,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
 
     setUnits((prev) => [...prev, unit]);
+    if (firebaseUser) {
+      void syncUnitToCloud(unit, true).catch(() => {});
+    }
     addAuditLog('UNIT_CREATED', 'Unit', id, undefined, `Added unit ${unit.unitNumber}`);
 
     // Check if capacity is approaching 80%+
@@ -2416,7 +2549,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
     // 2. Authoritative backend enforcement
     try {
-      const response = await fetch('/api/buildings', {
+      const response = await authenticatedFetch('/api/buildings', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -2528,6 +2661,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     setTickets((prev) => [newTicket, ...prev]);
+    if (firebaseUser) {
+      void syncTicketToCloud(newTicket, true).catch(() => {});
+    }
 
     // Send notification
     setNotifications((prev) => [
@@ -2551,6 +2687,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       prev.map((t) => {
         if (t.id === ticketId) {
           addAuditLog('TICKET_STATUS_UPDATED', 'ServiceTicket', t.code, `Status: ${t.status}`, `Status: ${status}`);
+          if (firebaseUser) {
+            void updateTicketStatusInCloud(ticketId, status).catch(() => {});
+          }
           return { ...t, status, resolutionNotes: notes || t.resolutionNotes };
         }
         return t;

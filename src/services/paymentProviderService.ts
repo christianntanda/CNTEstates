@@ -45,8 +45,127 @@ import { recordSubscriptionHistory } from './subscriptionHistoryEngine';
 
 export const PAYMENT_PROVIDER_NAME = 'Stripe Enterprise Gateway' as const;
 export const PAYMENT_PROVIDER_CODE = 'stripe' as const;
-export const DEFAULT_WEBHOOK_SECRET = 'whsec_cntestates_live_secret_2026_auth_token_99x';
 export const TIMESTAMP_TOLERANCE_SECONDS = 300; // 5 minutes max clock skew / replay window
+
+/**
+ * Generates an ephemeral, non-hardcoded secret suitable only for isolated unit/test runs.
+ * Live servers MUST supply process.env.PAYMENT_WEBHOOK_SECRET.
+ */
+export function createEphemeralWebhookTestSecret(): string {
+  const randomBytes = new Uint8Array(24);
+  if (typeof globalThis !== 'undefined' && globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(randomBytes);
+  } else {
+    for (let i = 0; i < randomBytes.length; i++) {
+      randomBytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(randomBytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Pure TypeScript SHA-256 & HMAC-SHA256 for consistent webhook signature verification in Node & test runtimes
+const SHA256_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+function sha256Bytes(message: Uint8Array): Uint8Array {
+  const bitLen = message.length * 8;
+  const paddedLen = Math.ceil((message.length + 9) / 64) * 64;
+  const padded = new Uint8Array(paddedLen);
+  padded.set(message);
+  padded[message.length] = 0x80;
+  const view = new DataView(padded.buffer);
+  view.setUint32(paddedLen - 8, Math.floor(bitLen / 0x100000000), false);
+  view.setUint32(paddedLen - 4, bitLen >>> 0, false);
+
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const w = new Uint32Array(64);
+
+  for (let offset = 0; offset < paddedLen; offset += 64) {
+    for (let i = 0; i < 16; i++) {
+      w[i] = view.getUint32(offset + i * 4, false);
+    }
+    for (let i = 16; i < 64; i++) {
+      const s0 = ((w[i - 15] >>> 7) | (w[i - 15] << 25)) ^ ((w[i - 15] >>> 18) | (w[i - 15] << 14)) ^ (w[i - 15] >>> 3);
+      const s1 = ((w[i - 2] >>> 17) | (w[i - 2] << 15)) ^ ((w[i - 2] >>> 19) | (w[i - 2] << 13)) ^ (w[i - 2] >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let i = 0; i < 64; i++) {
+      const S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+      const ch = (e & f) ^ (~e & g);
+      const temp1 = (h + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+      const S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+      const maj = (a & b) ^ (a & c) ^ (b & c);
+      const temp2 = (S0 + maj) >>> 0;
+      h = g; g = f; f = e; e = (d + temp1) >>> 0;
+      d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  }
+
+  const out = new Uint8Array(32);
+  const outView = new DataView(out.buffer);
+  [h0, h1, h2, h3, h4, h5, h6, h7].forEach((val, idx) => outView.setUint32(idx * 4, val, false));
+  return out;
+}
+
+function hmacSha256Hex(secret: string, message: string): string {
+  const encoder = new TextEncoder();
+  let keyBytes: Uint8Array = encoder.encode(secret);
+  if (keyBytes.length > 64) {
+    keyBytes = sha256Bytes(keyBytes);
+  }
+  const blockKey = new Uint8Array(64);
+  blockKey.set(keyBytes);
+  const oKeyPad = new Uint8Array(64);
+  const iKeyPad = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) {
+    oKeyPad[i] = blockKey[i] ^ 0x5c;
+    iKeyPad[i] = blockKey[i] ^ 0x36;
+  }
+  const msgBytes = encoder.encode(message);
+  const inner = new Uint8Array(64 + msgBytes.length);
+  inner.set(iKeyPad);
+  inner.set(msgBytes, 64);
+  const innerHash = sha256Bytes(inner);
+  const outer = new Uint8Array(64 + 32);
+  outer.set(oKeyPad);
+  outer.set(innerHash, 64);
+  const finalHash = sha256Bytes(outer);
+  return Array.from(finalHash, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+/**
+ * Computes a Stripe-style HMAC-SHA256 webhook signature header (`t=<ts>,v1=<hex>`).
+ */
+export function computeWebhookSignatureHeader(
+  payload: string | object,
+  secret: string,
+  timestampSeconds: number = Math.floor(Date.now() / 1000)
+): string {
+  const serialized = typeof payload === 'string' ? payload : JSON.stringify(payload);
+  const digest = hmacSha256Hex(secret, `${timestampSeconds}.${serialized}`);
+  return `t=${timestampSeconds},v1=${digest}`;
+}
 
 export interface ProviderCustomer {
   provider_customer_id: string; // e.g. cus_stripe_org1_8941
@@ -595,18 +714,46 @@ export function executeProviderCancellation(params: {
  */
 export function authenticateWebhookRequest(
   signatureHeader?: string | null,
-  secret: string = DEFAULT_WEBHOOK_SECRET
+  secret?: string | null,
+  rawPayload?: string | object
 ): { authenticated: boolean; reason?: string } {
-  if (!signatureHeader) {
+  if (!secret || secret.trim().length < 12) {
+    return { authenticated: false, reason: 'Server webhook signing secret is not configured' };
+  }
+
+  if (!signatureHeader || !signatureHeader.trim()) {
     return { authenticated: false, reason: 'Missing signature header (stripe-signature or x-webhook-secret)' };
   }
 
-  // Accepts explicit matching secret, bearer token, or formatted stripe signature containing v1
+  const header = signatureHeader.trim();
+
+  // 1. Cryptographic Stripe-style HMAC-SHA256 header: t=<unix>,v1=<hmac_sha256_hex>
+  if (header.includes('t=') && header.includes('v1=')) {
+    const parts = header.split(',').reduce<Record<string, string>>((acc, part) => {
+      const idx = part.indexOf('=');
+      if (idx > 0) {
+        acc[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
+      }
+      return acc;
+    }, {});
+
+    const ts = Number(parts['t']);
+    const sig = parts['v1'];
+    if (!ts || !sig || !rawPayload) {
+      return { authenticated: false, reason: 'Malformed cryptographic webhook signature header' };
+    }
+    const serialized = typeof rawPayload === 'string' ? rawPayload : JSON.stringify(rawPayload);
+    const expected = hmacSha256Hex(secret, `${ts}.${serialized}`);
+    if (constantTimeEquals(sig, expected)) {
+      return { authenticated: true };
+    }
+    return { authenticated: false, reason: 'HMAC-SHA256 webhook signature mismatch' };
+  }
+
+  // 2. Constant-time direct shared-secret match (x-webhook-secret or Bearer token)
   if (
-    signatureHeader === secret ||
-    signatureHeader === `Bearer ${secret}` ||
-    signatureHeader.includes('v1=') ||
-    signatureHeader.startsWith('t=')
+    constantTimeEquals(header, secret) ||
+    constantTimeEquals(header, `Bearer ${secret}`)
   ) {
     return { authenticated: true };
   }
@@ -692,6 +839,12 @@ export function processProviderWebhook(params: {
   secret?: string;
   toleranceSeconds?: number;
   organizationResolver?: (orgIdOrCustId: string) => any;
+  ownershipValidator?: (context: {
+    organizationId: string | null;
+    customerId: string | null;
+    subscriptionId: string | null;
+    invoiceId: string | null;
+  }) => { valid: boolean; reason?: string };
   onEventProcessed?: (event: WebhookEventPayload, outcome: any) => void;
 }): {
   status: number;
@@ -750,8 +903,8 @@ export function processProviderWebhook(params: {
     dataObj.id?.startsWith('pi_') ? dataObj.id : (dataObj.payment_intent || null);
   const organizationId = dataObj.organization_id || dataObj.metadata?.organization_id || null;
 
-  // STEP 1: AUTHENTICATION
-  const auth = authenticateWebhookRequest(params.signatureHeader, params.secret || DEFAULT_WEBHOOK_SECRET);
+  // STEP 1: AUTHENTICATION (strictly requires explicit server/runtime secret, never hardcoded)
+  const auth = authenticateWebhookRequest(params.signatureHeader, params.secret, params.rawBody);
   if (!auth.authenticated) {
     const unauthEntry: WebhookAuditEntry = {
       audit_id: auditId,
@@ -784,6 +937,52 @@ export function processProviderWebhook(params: {
       auditEntry: unauthEntry,
       response: { error: auth.reason },
     };
+  }
+
+  // STEP 1b: STRICT ACCOUNT OWNERSHIP VALIDATION (prevent cross-account webhook mutation)
+  if (params.ownershipValidator) {
+    const ownership = params.ownershipValidator({
+      organizationId,
+      customerId: providerCustomerId,
+      subscriptionId: providerSubscriptionId,
+      invoiceId: providerInvoiceId,
+    });
+    if (!ownership.valid) {
+      const mismatchEntry: WebhookAuditEntry = {
+        audit_id: auditId,
+        received_at: nowIso,
+        event_id: eventId,
+        event_type: eventType,
+        provider: 'stripe',
+        authenticated: true,
+        verified: false,
+        idempotent: false,
+        idempotency_action: 'rejected_tampered',
+        http_status: 403,
+        affected_organization_id: organizationId,
+        affected_subscription_id: providerSubscriptionId,
+        provider_ids: {
+          customer_id: providerCustomerId,
+          subscription_id: providerSubscriptionId,
+          invoice_id: providerInvoiceId,
+          payment_id: providerPaymentId,
+        },
+        processing_duration_ms: Date.now() - startTime,
+        summary: `Account ownership mismatch rejected: ${ownership.reason || 'Webhook identifiers do not belong to target organization'}`,
+        raw_payload_preview: JSON.stringify(payload).slice(0, 150),
+      };
+      webhookAuditTrail.unshift(mismatchEntry);
+      return {
+        status: 403,
+        success: false,
+        idempotent: false,
+        auditEntry: mismatchEntry,
+        response: {
+          error: 'WEBHOOK_ACCOUNT_OWNERSHIP_MISMATCH',
+          message: ownership.reason || 'Webhook customer/subscription identifiers do not match the target organization.',
+        },
+      };
+    }
   }
 
   // STEP 2: VERIFICATION

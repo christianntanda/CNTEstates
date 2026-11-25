@@ -108,8 +108,10 @@ import {
 import {
   authenticateWebhookRequest,
   verifyWebhookPayload,
-  DEFAULT_WEBHOOK_SECRET,
+  createEphemeralWebhookTestSecret,
 } from './paymentProviderService';
+
+const PROD_VALIDATION_WEBHOOK_SECRET = createEphemeralWebhookTestSecret();
 import {
   getBillingAuditLogs,
   recordBillingAuditEntry,
@@ -722,8 +724,8 @@ export const authoritativeProductionValidationItems: ProductionValidationItem[] 
     requirement: 'Security: Webhooks verify cryptographic signatures and reject replayed/expired timestamps',
     expected: 'Valid webhook passes authentication; invalid signature and expired timestamp are rejected',
     run: () => {
-      const invalidAuth = authenticateWebhookRequest('invalid_signature_secret_xyz');
-      const validAuth = authenticateWebhookRequest(DEFAULT_WEBHOOK_SECRET);
+      const invalidAuth = authenticateWebhookRequest('invalid_signature_secret_xyz', PROD_VALIDATION_WEBHOOK_SECRET);
+      const validAuth = authenticateWebhookRequest(PROD_VALIDATION_WEBHOOK_SECRET, PROD_VALIDATION_WEBHOOK_SECRET);
       const expiredPayload = {
         id: 'evt_expired_99',
         type: 'invoice.paid',

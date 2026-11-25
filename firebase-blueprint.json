@@ -1,0 +1,878 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user account metadata and display preferences. Strictly private to the account owner or platform admin.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID matching the document ID."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "User full display name."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "minLength": 3,
+          "maxLength": 254,
+          "description": "User verified email address (PII)."
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Optional avatar image URL."
+        },
+        "defaultOrganizationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Primary organization ID associated with the user."
+        },
+        "preferredCurrency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 10,
+          "pattern": "^[A-Z]{3}$",
+          "description": "ISO 4217 currency code for display."
+        },
+        "preferredLanguage": {
+          "type": "string",
+          "enum": ["en", "fr", "es", "pt"],
+          "description": "Preferred UI locale."
+        },
+        "accountCategory": {
+          "type": "string",
+          "enum": ["org_owner", "portfolio_manager", "property_manager", "building_manager", "finance_manager", "maintenance_manager", "technician", "contractor", "security_officer", "facility_manager", "tenant", "auditor"],
+          "description": "User operational role category (platform_admin is strictly out-of-band via /admins)."
+        },
+        "linkedProviders": {
+          "type": "array",
+          "description": "Linked Firebase Auth provider IDs (e.g. google.com, microsoft.com, apple.com, github.com, password). Bounded to max 10 entries."
+        },
+        "termsAcceptedAt": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "ISO timestamp recording user acceptance of CNTEstates Terms and Conditions."
+        },
+        "privacyAcceptedAt": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "ISO timestamp recording user acceptance of CNTEstates Privacy Policy."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of user document creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last profile update."
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "email",
+        "defaultOrganizationId",
+        "preferredCurrency",
+        "preferredLanguage",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminRecord": {
+      "title": "AdminRecord",
+      "description": "Trusted platform administrator registry document. Managed strictly out-of-band.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the administrator."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254,
+          "description": "Administrator email address."
+        },
+        "grantedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when admin privileges were granted."
+        }
+      },
+      "required": ["uid", "email", "grantedAt"]
+    },
+    "Organization": {
+      "title": "Organization",
+      "description": "Multi-tenant landlord or property management organization workspace.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique organization identifier."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the organization owner."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Legal or trading name of the organization."
+        },
+        "planId": {
+          "type": "string",
+          "enum": ["free", "starter", "basic", "professional", "business", "enterprise"],
+          "description": "Active CNTEstates subscription tier."
+        },
+        "subscriptionStatus": {
+          "type": "string",
+          "enum": ["free", "trial", "active", "past_due", "payment_failed", "suspended", "cancelled", "expired", "pending_activation"],
+          "description": "Subscription lifecycle status."
+        },
+        "operatingCountry": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 80,
+          "description": "Primary operating country name."
+        },
+        "baseCurrency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 10,
+          "pattern": "^[A-Z]{3}$",
+          "description": "Organization base accounting currency."
+        },
+        "billingCurrency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 10,
+          "pattern": "^[A-Z]{3}$",
+          "description": "Subscription billing currency."
+        },
+        "monthlySpend": {
+          "type": "number",
+          "description": "Current subscription spend in USD master currency."
+        },
+        "renewalDate": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Next billing cycle renewal date (YYYY-MM-DD)."
+        },
+        "companyAddress": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Branded legal billing address."
+        },
+        "companyEmail": {
+          "type": "string",
+          "maxLength": 254,
+          "description": "Branded billing contact email."
+        },
+        "companyPhone": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Branded contact phone number."
+        },
+        "taxRegistrationNumber": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Statutory VAT/GST/EIN registration number."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "name",
+        "planId",
+        "subscriptionStatus",
+        "operatingCountry",
+        "baseCurrency",
+        "billingCurrency",
+        "monthlySpend",
+        "renewalDate",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "OrganizationMember": {
+      "title": "OrganizationMember",
+      "description": "Member role assignment within a tenant organization.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the member."
+        },
+        "organizationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent organization ID."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["org_owner", "portfolio_manager", "property_manager", "building_manager", "finance_manager", "maintenance_manager", "technician", "contractor", "security_officer", "facility_manager", "tenant", "auditor"],
+          "description": "Assigned organizational role."
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Display name of the member."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of membership creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of membership update."
+        }
+      },
+      "required": ["uid", "organizationId", "role", "displayName", "createdAt", "updatedAt"]
+    },
+    "Property": {
+      "title": "Property",
+      "description": "Real estate property managed by an organization.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique property identifier."
+        },
+        "organizationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent organization ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Property name."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["residential", "commercial", "mixed_use", "retail", "industrial", "student_accommodation", "other"],
+          "description": "Property classification."
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240,
+          "description": "Street address."
+        },
+        "city": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "City name."
+        },
+        "region": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Province, state, or region."
+        },
+        "country": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Country name."
+        },
+        "postalCode": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Postal or ZIP code."
+        },
+        "ownerName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Legal property owner name."
+        },
+        "managerName": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Assigned property manager."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Property description."
+        },
+        "imageUrl": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Cover photo URL."
+        },
+        "yearBuilt": {
+          "type": "number",
+          "description": "Construction year."
+        },
+        "totalBuildings": {
+          "type": "number",
+          "description": "Number of buildings in the property."
+        },
+        "totalUnits": {
+          "type": "number",
+          "description": "Total rental units."
+        },
+        "occupiedUnits": {
+          "type": "number",
+          "description": "Currently occupied units."
+        },
+        "parkingSpaces": {
+          "type": "number",
+          "description": "Total parking spaces."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "under_renovation", "development"],
+          "description": "Operational property status."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "organizationId",
+        "ownerId",
+        "name",
+        "type",
+        "address",
+        "city",
+        "country",
+        "totalBuildings",
+        "totalUnits",
+        "occupiedUnits",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Unit": {
+      "title": "Unit",
+      "description": "Individual rental unit belonging to a property and organization.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique unit identifier."
+        },
+        "organizationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent organization ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "propertyId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated property ID."
+        },
+        "buildingId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated building ID."
+        },
+        "unitNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Unit number or suite label."
+        },
+        "floor": {
+          "type": "number",
+          "description": "Floor level."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["apartment", "penthouse", "office_suite", "retail_shop", "warehouse", "studio", "parking_bay", "storage"],
+          "description": "Unit category."
+        },
+        "squareMeters": {
+          "type": "number",
+          "description": "Area in square meters."
+        },
+        "monthlyRent": {
+          "type": "number",
+          "description": "Base monthly rental rate."
+        },
+        "currency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 10,
+          "pattern": "^[A-Z]{3}$",
+          "description": "Rent currency code."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["occupied", "vacant", "maintenance", "reserved"],
+          "description": "Occupancy status."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "organizationId",
+        "ownerId",
+        "propertyId",
+        "unitNumber",
+        "floor",
+        "type",
+        "squareMeters",
+        "monthlyRent",
+        "currency",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ServiceTicket": {
+      "title": "ServiceTicket",
+      "description": "Maintenance or operational service ticket with terminal state locking when closed.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique ticket identifier."
+        },
+        "organizationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent organization ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40,
+          "description": "Human-readable ticket code (e.g., CBM-00452)."
+        },
+        "propertyId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Associated property ID."
+        },
+        "propertyName": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Associated property name."
+        },
+        "unitNumber": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Unit label."
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160,
+          "description": "Short issue summary."
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Detailed maintenance description."
+        },
+        "category": {
+          "type": "string",
+          "enum": ["electrical", "plumbing", "hvac", "generator", "elevator", "fire_systems", "cctv_security", "structural", "appliances", "cleaning", "pest_control"],
+          "description": "Maintenance discipline."
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["emergency", "critical", "high", "normal", "low"],
+          "description": "SLA priority level."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["new", "assigned", "in_progress", "awaiting_contractor", "awaiting_parts", "completed", "verified", "closed"],
+          "description": "Ticket lifecycle state (terminal when closed)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "organizationId",
+        "ownerId",
+        "code",
+        "propertyId",
+        "title",
+        "category",
+        "priority",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SubscriptionInvoice": {
+      "title": "SubscriptionInvoice",
+      "description": "Billing invoice record with immutable terminal locking once paid, void, or cancelled.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique invoice identifier."
+        },
+        "organizationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent organization ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "invoiceNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Sequential invoice number."
+        },
+        "planId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Subscription plan identifier."
+        },
+        "planName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Subscription plan display name."
+        },
+        "billingPeriod": {
+          "type": "string",
+          "enum": ["monthly", "quarterly", "annual", "custom"],
+          "description": "Billing cadence."
+        },
+        "currency": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 10,
+          "pattern": "^[A-Z]{3}$",
+          "description": "Invoice billing currency."
+        },
+        "subtotal": {
+          "type": "number",
+          "description": "Net invoice subtotal."
+        },
+        "tax": {
+          "type": "number",
+          "description": "Calculated statutory tax."
+        },
+        "discount": {
+          "type": "number",
+          "description": "Applied discount."
+        },
+        "total": {
+          "type": "number",
+          "description": "Gross invoice total."
+        },
+        "amountPaid": {
+          "type": "number",
+          "description": "Settled payment amount."
+        },
+        "amountDue": {
+          "type": "number",
+          "description": "Remaining balance due."
+        },
+        "paymentStatus": {
+          "type": "string",
+          "enum": ["unpaid", "paid", "partially_paid", "failed", "refunded", "waived"],
+          "description": "Payment settlement state."
+        },
+        "invoiceStatus": {
+          "type": "string",
+          "enum": ["draft", "open", "paid", "partially_paid", "past_due", "void", "uncollectible", "cancelled"],
+          "description": "Invoice lifecycle state (terminal when paid, void, or cancelled)."
+        },
+        "paymentMethod": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Masked payment method label."
+        },
+        "invoiceDate": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Issue date (YYYY-MM-DD)."
+        },
+        "dueDate": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Due date (YYYY-MM-DD)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of creation."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of last update."
+        }
+      },
+      "required": [
+        "id",
+        "organizationId",
+        "ownerId",
+        "invoiceNumber",
+        "planId",
+        "planName",
+        "billingPeriod",
+        "currency",
+        "subtotal",
+        "tax",
+        "discount",
+        "total",
+        "amountPaid",
+        "amountDue",
+        "paymentStatus",
+        "invoiceStatus",
+        "paymentMethod",
+        "invoiceDate",
+        "dueDate",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Append-only immutable audit trail record for organization and billing mutations.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique audit log ID."
+        },
+        "organizationId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent organization ID."
+        },
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Owner Firebase Auth UID."
+        },
+        "actorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Firebase Auth UID of the acting user."
+        },
+        "actorName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "description": "Display name of the actor."
+        },
+        "actorRole": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Role of the actor at time of action."
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Audit action code."
+        },
+        "entityType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80,
+          "description": "Affected domain entity type."
+        },
+        "entityId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Affected entity ID."
+        },
+        "details": {
+          "type": "string",
+          "maxLength": 1000,
+          "description": "Human-readable summary of the event."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of audit event."
+        }
+      },
+      "required": [
+        "id",
+        "organizationId",
+        "ownerId",
+        "actorUid",
+        "actorName",
+        "actorRole",
+        "action",
+        "entityType",
+        "entityId",
+        "details",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile and display preferences scoped strictly to the owning user or platform admin."
+    },
+    "/admins/{userId}": {
+      "schema": { "$ref": "#/entities/AdminRecord" },
+      "description": "Trusted platform admin lookup registry. Client writes strictly forbidden."
+    },
+    "/organizations/{orgId}": {
+      "schema": { "$ref": "#/entities/Organization" },
+      "description": "Tenant organization master workspace documents."
+    },
+    "/organizations/{orgId}/members/{memberId}": {
+      "schema": { "$ref": "#/entities/OrganizationMember" },
+      "description": "Role-based membership subcollection for an organization."
+    },
+    "/organizations/{orgId}/properties/{propertyId}": {
+      "schema": { "$ref": "#/entities/Property" },
+      "description": "Real estate properties owned by the parent organization."
+    },
+    "/organizations/{orgId}/units/{unitId}": {
+      "schema": { "$ref": "#/entities/Unit" },
+      "description": "Rental units within properties of the parent organization."
+    },
+    "/organizations/{orgId}/tickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/ServiceTicket" },
+      "description": "Maintenance and service tickets scoped to the parent organization."
+    },
+    "/organizations/{orgId}/invoices/{invoiceId}": {
+      "schema": { "$ref": "#/entities/SubscriptionInvoice" },
+      "description": "Subscription billing invoices scoped to the parent organization with immutable terminal states."
+    },
+    "/organizations/{orgId}/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Append-only immutable audit trail for the parent organization."
+    }
+  }
+}
